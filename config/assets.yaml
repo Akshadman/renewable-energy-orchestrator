@@ -1,0 +1,65 @@
+# Renewable Energy Orchestrator — asset & market configuration.
+# Units: power MW, energy MWh, prices ₹/MWh, carbon tCO2/MWh, time in 15-min ticks.
+
+sim:
+  tick_minutes: 15
+  ticks_per_day: 96
+  timezone: Asia/Kolkata
+  frequency_nominal_hz: 50.0
+  frequency_sensitivity_hz: 0.5     # Hz deviation per 100% supply/demand imbalance
+  nowcast_error: 0.03               # realised vs. nowcast error on renewables (fraction)
+
+solar_farms:   # Rajasthan / Gujarat
+  - {id: S1, name: Bhadla (RJ),        capacity_mw: 60, lat: 27.54, lon: 71.92, performance_ratio: 0.90, cloud_sensitivity: 1.0}
+  - {id: S2, name: Jodhpur (RJ),       capacity_mw: 45, lat: 26.24, lon: 73.02, performance_ratio: 0.88, cloud_sensitivity: 0.9}
+  - {id: S3, name: Jaisalmer (RJ),     capacity_mw: 40, lat: 26.91, lon: 70.91, performance_ratio: 0.90, cloud_sensitivity: 0.8}
+  - {id: S4, name: Charanka (GJ),      capacity_mw: 30, lat: 23.90, lon: 71.20, performance_ratio: 0.87, cloud_sensitivity: 1.1}
+  - {id: S5, name: Dholera (GJ),       capacity_mw: 20, lat: 22.25, lon: 72.19, performance_ratio: 0.86, cloud_sensitivity: 1.2}
+
+wind_farms:    # Gujarat / Tamil Nadu — hub-height (100 m) power curves
+  - {id: W1, name: Kutch (GJ),         capacity_mw: 80, lat: 23.25, lon: 69.67, cut_in_ms: 3.0, rated_ms: 12.0, cut_out_ms: 25.0}
+  - {id: W2, name: Muppandal (TN),     capacity_mw: 50, lat: 8.26,  lon: 77.55, cut_in_ms: 3.5, rated_ms: 12.5, cut_out_ms: 25.0}
+  - {id: W3, name: Dwarka (GJ),        capacity_mw: 30, lat: 22.24, lon: 68.97, cut_in_ms: 3.0, rated_ms: 11.5, cut_out_ms: 24.0}
+
+batteries:
+  - {id: B1, name: BESS-Bhadla, energy_mwh: 50,  power_mw: 25, round_trip_eff: 0.90, soc_min: 0.10, soc_max: 0.95, soc_init: 0.50, degradation_cost: 450}
+  - {id: B2, name: BESS-Kutch,  energy_mwh: 100, power_mw: 40, round_trip_eff: 0.90, soc_min: 0.10, soc_max: 0.95, soc_init: 0.50, degradation_cost: 400}
+
+consumers:     # base_mw = typical load; critical_frac must always be served
+  - {id: C1, name: Steel mill,     base_mw: 60, critical_frac: 0.60, dr_eligible: true,  profile: industrial}
+  - {id: C2, name: Cement plant,   base_mw: 45, critical_frac: 0.55, dr_eligible: true,  profile: industrial}
+  - {id: C3, name: Textile park,   base_mw: 35, critical_frac: 0.55, dr_eligible: true,  profile: commercial}
+  - {id: C4, name: Data centre,    base_mw: 30, critical_frac: 0.90, dr_eligible: false, profile: flat}
+
+grid:
+  import_limit_mw: 90
+  export_limit_mw: 70
+  carbon_intensity_t_per_mwh: 0.72   # Indian grid average
+
+market:
+  base_price: 4500             # ₹/MWh — synthetic price anchor
+  buy_adder: 400               # transmission/open-access charges on imports
+  sell_factor: 0.92            # export realises 92% of market price
+  carbon_price: 1500           # ₹/tCO2 (shadow price)
+  dr_incentive: 3500           # ₹/MWh of flexible load reduced via DR
+  curtailment_penalty: 1500    # ₹/MWh — shadow cost of wasted clean energy
+  voll_flexible: 20000         # ₹/MWh of non-DR flexible load shed
+  voll_critical: 200000        # ₹/MWh of critical load unserved
+  reserve_shortfall_penalty: 6000  # ₹/MWh-tick below reserve SoC
+  deviation_penalty: 2000      # ₹/MWh balancing charge for real-time imbalance
+
+agent:
+  horizon: 16                  # optimizer look-ahead (ticks)
+  llm_every_n_ticks: 8         # re-consult LLM at least this often
+  export_approval_mw: 50       # exports above this need human approval
+  permission_ticks: 8          # approval/rejection holds for this many ticks
+  max_relax_attempts: 2
+
+data:
+  iex_prices_csv: data/iex_prices.csv
+  replay_dir: data/replay
+  cache_dir: data/cache
+  cache_ttl_minutes: 60
+  api_timeout_s: 10
+  storm_weather_codes: [95, 96, 99, 65, 67, 82]   # thunderstorm / heavy rain
+  storm_wind_ms: 20.0          # alert when hub-height wind exceeds this
