@@ -1,11 +1,13 @@
 # ⚡ Renewable Energy Orchestrator
 
-An agentic AI control room that re-plans a renewable portfolio every 15 minutes. The portfolio is 5 solar farms (Rajasthan/Gujarat), 3 wind farms (Gujarat/Tamil Nadu), 2 batteries, 4 industrial consumers and a grid interconnection. The agent aims to **minimise cost, maximise clean energy and keep the grid reliable**.
+An **autonomous** AI control room for an industrial renewable energy portfolio. Every 15 minutes, and immediately after any shock, it decides how to run solar farms, wind farms, batteries, flexible loads and the grid connection. The goals are to **minimise cost, maximise clean energy and never cut critical load**. There is no human in the loop: the AI decides, acts and explains, and every action is logged.
 
-> **Core principle:** the LLM reasons and plans; a MILP optimizer does the math; a validator enforces physics.
-> The LLM never produces a number that gets executed.
+It works for **any industry**. You describe your site (loads, consumption data, generation resources, limits, maintenance and breakdown schedule, conservation hours, carbon and cost targets) in the dashboard, and the AI adapts.
 
-**Hackathon target:** D2 × F3. The system uses structured, real weather and price data, is demonstrably reliable, and simulates full scenarios (10 shock types, 100-day Monte Carlo).
+> **Core principle:** the AI reasons over *all* signals at once, a MILP optimizer computes the megawatts, a
+> stress test measures risk across 100 possible futures, and a validator enforces physics. An LLM, when
+> enabled, can only choose among plans that already passed those checks. It never produces a number that
+> gets executed.
 
 ---
 
@@ -15,119 +17,153 @@ An agentic AI control room that re-plans a renewable portfolio every 15 minutes.
 cd orchestrator
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # optional: add ANTHROPIC_API_KEY to enable the LLM reasoner
+cp .env.example .env            # optional: add ANTHROPIC_API_KEY to let Claude choose & explain
 
-pytest                          # 56 tests, ~15 s
 streamlit run app.py            # dashboard (works with no API key and no internet)
-python -m eval.evaluate --n 100 # Monte Carlo: agent vs baseline vs no-battery (~1-2 min, 8 cores)
+pytest                          # 70 tests (~5 min: several simulate full days)
+python -m eval.evaluate --n 100 # Monte Carlo: AI vs business-as-usual vs no-battery
 ```
 
-Tested on Python 3.9 and later; the code uses `from __future__ import annotations`, so it runs unchanged on 3.11+. Without an API key (or if the API fails), a deterministic **mock reasoner** takes over, so the demo always runs. API usage is billed separately from a Claude.ai subscription. The mock reasoner is free.
+Runs on Python 3.9+. Without an API key (or if the API fails) the optimizer and priority ladder decide on their own, so the demo always runs and is free. API usage is billed separately from a Claude.ai subscription.
 
-## Architecture
+## How the AI decides
+
+There are no situation "cases" and no fixed playbook. Every tick runs one pass in which nothing is thrown away:
 
 ```mermaid
 flowchart LR
-    subgraph Data["Data layer (core/data_sources.py)"]
-        OM[OpenMeteoProvider<br/>live minutely_15] -->|fails| RP[ReplayProvider<br/>data/replay/*.csv]
-        RP -->|fails| SY[SyntheticProvider]
-        IEX[data/iex_prices.csv<br/>15-min blocks]
+    subgraph IN["Inputs (from your industry + live data)"]
+        D[Real-time demand<br/>& consumption data]
+        R[Resources, capacities<br/>& limits]
+        M[Maintenance &<br/>breakdown schedule]
+        T[Carbon & cost targets,<br/>risk tolerance]
+        W[Weather: live → last-year proxy<br/>→ saved day → simulated]
+        P[Prices: IEX 15-min]
     end
-    Data --> PC[Power curves<br/>GHI→PV MW, wind→turbine MW]
-    PC --> SIM[Digital twin<br/>core/simulator.py]
-    EV[Shock injectors<br/>core/events.py] --> SIM
-    SIM --> FC[Forecaster<br/>P10/P50/P90]
-
-    subgraph Agent["Agent loop — every tick (agent/agent.py)"]
-        P[Perceive<br/>get_state / get_forecast / get_alerts] --> A[Assess<br/>situation label]
-        A --> C[Set criteria<br/>weights, reserve, P10/P50]
-        C --> O[run_optimizer<br/>MILP · PuLP/CBC]
-        O --> V{validate_actions}
-        V -->|fail / infeasible| R[Relax ×2] --> O
-        R -->|still failing| FB[Safe fallback controller]
-        V -->|pass| G{High impact?}
-        FB --> G
-        G -->|shed / big export / delay maint.| H[request_human_approval]
-        G -->|no| X[execute_actions]
-        H --> X
-        X --> E[Explain + JSONL audit log]
-    end
-    FC --> P
-    SIM --> P
-    X --> SIM
-    LLM[Claude via tool use<br/>only on change or every N ticks] -.criteria & explanation.-> C
-    MOCK[Mock reasoner<br/>offline / fallback] -.-> C
+    IN --> PER[PERCEIVE<br/>state + learned P10/P50/P90<br/>forecasts + alerts with probabilities]
+    PER --> DIA[DIAGNOSE<br/>9 continuous signals,<br/>all measured together]
+    DIA --> OPT[OPTIONS<br/>MILP builds 9 plans:<br/>10% → 85% battery reserve]
+    OPT --> ST[STRESS-TEST<br/>each plan × 100 futures<br/>avg ₹ · worst ₹ · P shortfall]
+    ST --> CH[CHOOSE<br/>priority ladder<br/>± Claude among eligible]
+    CH --> VER{VERIFY<br/>physics validator}
+    VER -->|fail| REP[repair: relax ×2] --> FB[safe fallback]
+    VER -->|pass| ACT[ACT autonomously<br/>+ explain + log]
+    FB --> ACT
+    ACT --> OUT[Outputs: actions log, energy produced,<br/>money & CO₂ saved, efficiency, clean %]
+    ACT --> LRN[LEARN<br/>forecast bias & band width,<br/>saved for tomorrow]
+    LRN -.-> PER
+    DA[Day-ahead 24 h plan<br/>re-based after shocks] -.battery target.-> OPT
 ```
 
-| Folder | Contents |
+1. **Perceive:** current state, forecasts already corrected by what the AI has learned, prices, and alerts that carry a **probability** (e.g. "storm 35% likely in 90 min").
+2. **Diagnose:** nine continuous signals, measured together: storm probability, price vs normal, grid-line headroom, batteries in service, generation offline, demand surprise, renewable shortfall, battery charge, CO₂ budget pace. A storm and a price spike at the same time are both kept and both affect the decision.
+3. **Options:** the MILP optimizer builds 9 candidate plans, from "Max savings" (10% battery reserve) to "Fortress" (85%), plus a green-leaning plan. All of them aim at the **day-ahead plan's** battery trajectory, which is re-solved after every shock.
+4. **Stress-test:** each plan is replayed in 100 sampled futures. Futures are drawn from the forecast uncertainty and from each alert's probability, so a 35% storm hits in about 35 of them. The result is average cost, worst-case (P95) cost, the **probability of cutting critical load**, CO₂, curtailment and battery wear.
+5. **Choose, using a priority ladder with thresholds:**
+   1. *Safety:* the plan must pass the physics validator.
+   2. *Reliability:* shortfall risk must be within **your** tolerance (default 2%).
+   3. *Cost vs clean:* best score = avg cost + risk aversion × (worst − avg) + carbon-pressure × (CO₂ + curtailment value).
+   4. *Battery life:* among near-equal plans, pick the one with the least wear.
+
+   With an API key, Claude sees the whole briefing and may pick a different **eligible** plan, with its reasoning. Anything else is rejected by code.
+6. **Verify → act → explain:** validate again; if nothing is valid, repair (allow controlled flexible-load reduction), then fall back to the safe controller. Then execute and write a 2–3 sentence explanation, e.g. *"I compared 9 plans across 100 futures and chose 'Protective' (≥62% reserve)… 'Max savings' would save ₹84,597 but risks a critical shortfall in 54% of futures (limit 2%)."*
+7. **Learn:** compare every 1-hour-ahead forecast with what happened, learn each resource's bias and how wide the P10–P90 band should be, apply that immediately, and save it to `data/learning.json` for the next day.
+
+**Operations, also autonomous:** maintenance jobs that may move are shifted into the slot that loses the least energy × price. Breakdowns get an inspection crew immediately, which shortens the outage.
+
+### Why probability matters
+
+The chosen protection depends on *how likely* a risk is, through the stress test rather than a rule. Measured on one simulated day with a storm forecast at 18:00 (`tests/test_agent.py::test_protection_rises_with_storm_probability`):
+
+| Storm probability | 0% | 5–50% | 70%+ |
+|---|---|---|---|
+| Chosen plan (battery reserve) | Max savings (10%) | Strong reserve (74%) | Fortress (85%) |
+
+When a storm would threaten **critical** load (e.g. batteries nearly empty at dawn), any probability above your tolerance triggers protection, because that is what "2% acceptable risk" means. Raise the tolerance slider and the AI accepts more risk for lower cost.
+
+## Your industry: inputs the dashboard accepts
+
+| Input (Setup tab) | Used for |
 |---|---|
-| `config/assets.yaml` | Every asset, market and agent parameter, including real lat/lon per farm |
-| `core/` | `models`, `simulator`, `events`, `forecaster`, `optimizer`, `validator`, `baseline`, `fallback`, `data_sources`, `power_curves` |
-| `agent/` | `agent.py` (loop, approvals, maintenance), `tools.py` (9 tool schemas and implementations), `prompts.py`, `mock_reasoner.py` |
-| `eval/evaluate.py` | Monte Carlo runner; writes `eval/results/results.csv`, `summary.csv` and interactive HTML charts |
-| `logs/decisions.jsonl` | One line per tick: situation, criteria, attempts, validation, action, approvals, tool calls, KPIs, explanation |
-| `tests/` | Physics, optimizer, guardrail, agent (including a scripted fake Claude) and data-layer tests (mocked API) |
+| Loads: typical MW, critical %, demand-response eligibility, daily shape | Demand model; critical load is never cut voluntarily |
+| Utility consumption CSV (one column per load) | Replaces the demand shape with your real data (any time step, resampled to 15 min) |
+| Solar / wind farms with lat-lon and capacity; batteries | Weather → MW via standard power curves; dispatch |
+| Grid import / export limits | Hard constraints (live-derated by congestion and storms) |
+| Maintenance & breakdown schedule | Breakdowns fixed; maintenance with "± hours" is moved by the AI |
+| Energy conservation schedule | Planned demand reduction windows |
+| Annual CO₂ target, target ₹/MWh, risk tolerance, worst-case aversion | Ladder thresholds and scoring |
 
-### Optimizer (rolling-horizon MILP)
-It plans 16 ticks (4 h) ahead, is re-solved every tick, and only the first tick is executed.
+Profiles can be saved and loaded (`config/profiles/*.yaml`). The default is a Rajasthan / Gujarat / Tamil Nadu portfolio (`config/assets.yaml`).
 
-- **Variables:** charge and discharge per battery (a binary prevents both at once), grid import and export (a binary sets direction), curtailment per farm, paid demand response, flexible shedding and critical unserved (the last two only when permitted).
-- **Constraints:** power balance; SoC dynamics with √η efficiency; rate limits; SoC bounds; battery availability; live line limits; a soft reserve SoC floor.
-- **Objective:** `w_cost·(energy + degradation + DR + shedding − sales − terminal SoC value) + w_clean·(curtailment + import carbon) + w_reliability·(reserve shortfall + VOLL·unserved critical)`.
-- **Uncertainty modes:** `p50` uses expected values; `p10` uses conservative renewables and P90 demand.
-- **Failure handling:** infeasible or failed solves return a status and never raise.
-
-### Real-data layer
-- **Open-Meteo:** one request covers all 8 sites, using `minutely_15=shortwave_radiation,wind_speed_100m,cloud_cover,weather_code`. Responses are cached in `data/cache/` (past dates permanently, today/future for 60 min). Every successful fetch is also saved as a replay CSV.
-- **Conversion to MW:** PV = Cap · GHI/1000 · PR. Wind uses a cubic curve between cut-in and rated speed and is zero above cut-out.
-- **Storm alerts:** raised for WMO codes 95/96/99/65/67/82 or hub-height wind ≥ 20 m/s within the horizon.
-- **Fallback:** Open-Meteo → Replay → Synthetic. The dashboard banner shows the **active** source and why it fell back.
-- **Prices:** loaded from `data/iex_prices.csv` (IEX-style 15-minute MCP blocks). ⚠️ The shipped file is a **generated sample** shaped like IEX DAM prices and is labelled as such in its first line. Replace it with a real IEX export in the same format (`date, block, time_from, mcp_rs_mwh`). The synthetic source uses its own net-demand-correlated price instead.
-- **Replay data:** `data/replay/` ships two real Open-Meteo days (2026-09-25 and 2026-09-26).
+## Data sources
+- **Live:** Open-Meteo `minutely_15` (shortwave radiation, 100 m wind, cloud cover, weather code), one request for all sites and cached.
+- **Proxy:** the same calendar day **one year earlier** from the Open-Meteo archive (hourly, interpolated to 15 min). Used automatically if live fails.
+- **Replay:** saved real days in `data/replay/`. **Synthetic:** statistical weather.
+- **Fallback chain:** Live → Last year → Replay → Synthetic. The sidebar shows the active source and why.
+- **Storm alerts** come from WMO codes 95/96/99/65/67/82 or hub-height wind ≥ 20 m/s, with a probability that decays with lead time.
+- **Prices:** `data/iex_prices.csv` in IEX 15-minute block format. ⚠️ The shipped file is a **generated sample** (labelled in its first line); replace it with a real IEX export.
 
 ## Dashboard
-- **Sidebar:** data-source selector, day, seed, LLM toggle, auto-approve toggle, Reset, Play/Pause, Step, speed.
-- **Live tab:** active-source banner and KPI cards (cost ₹, clean %, curtailed MWh, unserved load, violations, CO₂). Charts cover generation by source vs demand, battery SoC, buy/sell price, and grid net import against live limits.
-- **Agent panel:** situation, weights, reserve, forecast mode, explanation, notes and alerts, plus a button for each of the 10 shock types, the approval queue (Approve/Reject) and the action log.
-- **Results tab:** Monte Carlo distributions (box plus all points) for each metric, a P5/mean/P95 table, and a button to run a new batch.
+1. **🏭 Your industry:** all the inputs above, with validation, *Apply & start day* and *Save as profile*.
+2. **⚡ Live control room:**
+   - **Status line:** e.g. "🟠 18:00 — Storm risk 35% in 90 min · Price 2.1× normal → AI decision: Protective".
+   - **Output cards:** energy produced, money saved, carbon saved, clean %, generation efficiency, load cut / violations. Savings are measured against a business-as-usual twin running the same day with the same shocks.
+   - **Charts:** where the power came from, battery charge vs the AI's chosen reserve, price, grid flow vs line limits.
+   - **What the AI is thinking:** all signals as bars, the diagnosis, the decision and its explanation, and a table of every plan considered with its stress-test numbers and why it won or lost.
+   - **Make something happen:** inject any of 11 events with parameters (storm probability and arrival, which farm breaks, how bad). The AI re-plans immediately.
+3. **📊 Results & learning:** today's AI vs business-as-usual, clean vs traditional energy, what the AI has learned (error before and after), and the Monte Carlo proof.
 
-## Results (100 randomized days, 3 unannounced shocks per day, mock reasoner)
+## Results
 
-All three controllers see identical weather, demand, prices and shocks for each seed. Reproduce with `python -m eval.evaluate --n 100`.
+100 randomized synthetic days, 3 unannounced shocks per day (storms with random probabilities, breakdowns,
+price spikes, congestion, …), offline mode. All controllers see identical weather, demand, prices and shocks.
+Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
 
-| Mean per day | Agent | Naive baseline | No battery |
+| Mean per day | **AI** | Business-as-usual | No battery |
 |---|---:|---:|---:|
-| Cost (₹ lakh) | **72.9** | 86.7 | 93.1 |
-| Clean energy | **71.5 %** | 64.3 % | 60.1 % |
-| Curtailment (MWh) | **13.7** | 28.0 | 51.6 |
-| Unserved load (MWh) | **9.7** | 47.7 | 53.2 |
-| Constraint violations | **0.00** (max 0) | 6.06 | 4.64 |
-| CO₂ (t) | **576** | 847 | 942 |
+| Cost (₹ lakh) | **71.9** (−23%) | 93.0 | 100.1 |
+| Clean energy | **72.4 %** | 61.9 % | 57.6 % |
+| Curtailment (MWh) | **11.0** | 22.5 | 44.2 |
+| Load cut (MWh) | **5.2** (−82%) | 29.5 | 32.3 |
+| Safety violations | **0.00** (max 0) | 4.84 | 3.59 |
+| CO₂ (t) | **556** (−41%) | 947 | 1053 |
 
-- **Cost:** the agent was cheaper than the baseline on 97 of 100 days.
-- **Unserved critical load:** the agent had some on 16 days, versus 66 for the baseline. These are physical shortages, for example an unannounced line derate after batteries were legitimately spent on a price spike, or a storm that cuts wind and the import line together. Here the validator rejects every plan, and the safe fallback minimises the shortfall and logs an `EMERGENCY` note.
-- **"Violations"** counts executed commands that broke a physical limit (SoC, rate, line, availability). Unserved load is reported separately.
+- **Cost:** the AI was cheaper on **100 of 100** days.
+- **Critical load cut:** the AI had some on 7 of 100 days, vs 20 for business-as-usual. These are physical shortages that no plan can cover, e.g. a storm hitting while the line is congested. The AI then protects critical load first and says so.
+- **"Safety violations"** are executed commands that broke a physical limit (SoC, rate, line, unavailable asset). Load cut is reported separately.
 
-## 9-blocker claim → evidence
-
-These are the nine blockers that usually stop an LLM agent from controlling physical infrastructure. Each row points to where the system addresses it and the test that proves it. *(Rename the rows to match the official hackathon rubric if it uses different wording.)*
+## Blocker → evidence
 
 | # | Blocker | How it's handled | Evidence |
 |---|---|---|---|
-| 1 | LLM hallucinates numbers | Tools accept only criteria, ids and text; MW values come from the MILP | `agent/tools.py`, `test_full_day_with_llm_tool_use` |
-| 2 | Physically unsafe actions | Validator checks SoC, rate, line, balance, critical load and availability before every execution; the simulator independently clips and counts violations | `core/validator.py`, `tests/test_guards.py`, MC: 0 violations in 100 days |
-| 3 | Solver infeasibility or crash | Clear status, relax ×2, then a safe fallback that always respects hard limits | `test_infeasible_handled_without_crash`, `test_relax_then_fallback_on_infeasible`, `test_fallback_always_valid_over_stressed_day` |
-| 4 | LLM outage or no API key | Mock reasoner is used transparently, and each decision records which reasoner ran | `test_full_day_without_api_key`, `test_llm_outage_falls_back_to_mock` |
-| 5 | Data-source outage | Open-Meteo → Replay → Synthetic with caching; the active source is shown in the UI | `tests/test_data_sources.py` (mocked HTTP errors, timeouts, malformed payloads) |
-| 6 | Forecast uncertainty | P10/P50/P90 forecasts; the agent switches to conservative P10 for storms, failures and surges; rolling re-plans | `test_forecast_quantiles_ordered_and_nowcast_exact`, `test_p10_mode_is_more_conservative`, `test_storm_raises_reserve_and_uses_p10` |
-| 7 | No human oversight | Shedding, exports over 50 MW and maintenance delays go to an approval queue; the plan is re-optimised without them until approved | `test_human_approval_gates_large_export` |
-| 8 | Not auditable or explainable | JSONL record per tick (criteria, attempts, validation, tool calls, KPIs) plus a plain-English rationale | `logs/decisions.jsonl`, `test_full_day_without_api_key` |
-| 9 | Unproven value and runaway LLM cost | 100-day Monte Carlo against two baselines; the LLM is called only when the situation changes or every N ticks | `eval/results/`, `test_full_day_with_llm_tool_use` (throttling asserted) |
+| 1 | LLM hallucinates numbers | The LLM can only pick a plan id among validated, stress-tested plans; MW come from the MILP | `agent/tools.py`, `test_llm_cannot_choose_ineligible_plan` |
+| 2 | Physically unsafe actions | Validator before every execution; simulator independently clips and counts violations | `core/validator.py`, `tests/test_guards.py`, Monte Carlo violations |
+| 3 | Rigid "case" logic | 9 continuous signals together; plans scored against probability-weighted futures | `test_all_signals_kept_together`, `test_protection_rises_with_storm_probability` |
+| 4 | Solver infeasibility / physical shortage | Clear status → relax ×2 → safe fallback, with a plain explanation | `test_infeasible_handled_without_crash`, `test_portfolio_without_wind_or_batteries_runs` |
+| 5 | LLM outage / no key | Optimizer + ladder decide alone; every decision records who decided | `test_llm_outage_keeps_running`, `test_full_autonomous_day` |
+| 6 | Data-source outage | Live → last-year proxy → replay → synthetic, cached, shown in UI | `tests/test_data_sources.py` (mocked HTTP) |
+| 7 | Asset breakdowns & maintenance | Outages modelled per asset; crews dispatched; flexible maintenance moved autonomously | `test_breakdown_triggers_autonomous_crew`, `test_maintenance_moved_without_approval` |
+| 8 | Not industry-agnostic | Any loads/assets/targets via Setup tab or YAML profile; custom consumption data | `tests/test_industry.py` |
+| 9 | Doesn't improve | Online forecast-bias & calibration learning, persisted daily | `test_learning_reduces_forecast_error`, `test_learning_persists_between_days` |
+| 10 | Unproven value | 100-day Monte Carlo vs two baselines + live savings vs a twin | `eval/results/`, `test_operation_measures_savings_vs_baseline` |
 
-## Events
-`cloud_cover`, `wind_surge`, `wind_drop`, `price_spike`, `battery_unavailable`, `line_congestion`, `demand_surge`, `forecast_update`, `storm_alert` (arrives after a 2 h lead: turbines cut out, solar dims, line derates, WMO code 95 is written into the weather), and `maintenance_window` (the agent moves it to the lowest-impact slot; a delay needs approval).
+## Code map
+
+| Path | What it does |
+|---|---|
+| `agent/agent.py` | The autonomous loop (perceive → … → learn), option ladder, repair, operations |
+| `agent/signals.py` | DIAGNOSE: continuous signals and human-readable headline |
+| `agent/stress_test.py` | Future sampling (forecast quantiles + storm probabilities) and plan replay |
+| `agent/narrator.py`, `prompts.py`, `tools.py` | Offline explanations; LLM prompt and the single `submit_decision` tool |
+| `agent/runner.py` | AI twin + business-as-usual twin in lockstep, headline outputs |
+| `core/optimizer.py` | Rolling-horizon MILP (PuLP/CBC); LP mode for the day-ahead plan |
+| `core/learning.py` | Online forecast-bias and band-width learning |
+| `core/simulator.py`, `events.py` | Digital twin, outages/maintenance, hidden storm outcomes, 11 shocks |
+| `core/data_sources.py` | Live / last-year / replay / synthetic weather, IEX prices, storm alerts |
+| `core/config.py` | Industry profiles: load, validate, save |
 
 ## Limitations
-- Single-bus model with no intra-portfolio network flows. Frequency is a proportional proxy of imbalance.
-- Demand is synthetic for every data source. Prices are a labelled sample until a real IEX file is dropped in.
-- Forecasts are future truth plus autocorrelated noise, not a trained model.
+- Single-bus model; frequency is a proportional proxy of imbalance.
+- Demand comes from shapes or your uploaded data; prices are a labelled sample until a real IEX file is added.
+- Forecasts are simulated (future truth + bias + noise), not a trained weather model; learning corrects bias and calibration only.
+- The option ladder has 9 discrete protection levels, so the response to risk is graded in steps, not perfectly continuous.

@@ -1,7 +1,7 @@
 """Monte Carlo evaluation: agent vs naive baseline vs no-battery over N randomized days.
 
 Usage:
-    python -m eval.evaluate --n 100            # mock reasoner (default, free & fast)
+    python -m eval.evaluate --n 100            # offline reasoner (default, free)
     python -m eval.evaluate --n 10 --llm       # consult the LLM (needs ANTHROPIC_API_KEY)
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ def run_day(seed: int, controller: str, n_events: int = 3, use_llm: bool = False
     pending = [Event(e.kind, e.start_tick, e.duration, dict(e.params)) for e in schedule]
     if controller == "agent":
         from agent.agent import OrchestratorAgent
-        agent = OrchestratorAgent(sim, cfg, use_llm=use_llm, auto_approve=True, log_path=None)
+        agent = OrchestratorAgent(sim, cfg, use_llm=use_llm, log_path=None, parallel=False)
         act = lambda: agent.step()  # noqa: E731
     else:
         ctrl = NaiveController(cfg, use_battery=controller == "baseline")

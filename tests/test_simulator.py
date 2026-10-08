@@ -59,14 +59,16 @@ def test_seeded_reproducibility(cfg):
 @pytest.mark.parametrize("kind", list(EVENTS))
 def test_every_event_applies(cfg, kind):
     sim = Simulator(cfg, seed=2)
-    before = (sim.solar_mult.copy(), sim.wind_mult.copy(), sim.demand_mult.copy(), sim.price_mult.copy(),
-              sim.line_mult.copy(), sim.battery_avail.copy(), len(sim.maintenance))
-    ev = sim.apply_event(make_event(kind, 40))
-    after = (sim.solar_mult, sim.wind_mult, sim.demand_mult, sim.price_mult, sim.line_mult,
-             sim.battery_avail, len(sim.maintenance))
+    names = ["solar_mult", "wind_mult", "demand_mult", "price_mult", "line_mult", "battery_avail", "solar_avail",
+             "wind_avail", "hidden_solar", "hidden_wind", "hidden_line"]
+    before = [getattr(sim, n).copy() for n in names] + [len(sim.maintenance)]
+    params = {"probability": 1.0} if kind == "storm_alert" else {}
+    ev = sim.apply_event(make_event(kind, 40, **params))
+    after = [getattr(sim, n) for n in names] + [len(sim.maintenance)]
     changed = any(not np.array_equal(x, y) for x, y in zip(before[:-1], after[:-1])) or before[-1] != after[-1]
     assert changed and ev.description
-    assert any(a.kind == kind for a in sim.event_alerts)
+    sim.tick = 40
+    assert sim.alerts(), f"{kind} raised no alert"
 
 
 def test_battery_unavailable_blocks_dispatch(cfg):

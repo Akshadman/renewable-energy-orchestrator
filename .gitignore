@@ -4,3 +4,4 @@ __pycache__/
 .env
 logs/*.jsonl
 data/cache/
+data/learning.json

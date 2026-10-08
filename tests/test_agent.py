@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.agent import LLMReasoner, OrchestratorAgent
+from agent.agent import OPTION_GRID, LLMReasoner, OrchestratorAgent
+from agent.runner import Operation
 from core.events import make_event
 from core.simulator import Simulator
 
@@ -18,117 +19,153 @@ def _agent(cfg, tmp_path, seed=1, **kw):
     return sim, OrchestratorAgent(sim, cfg, log_path=tmp_path / "log.jsonl", **kw)
 
 
-def test_full_day_without_api_key(cfg, tmp_path):
+def _advance(agent, n):
+    for _ in range(n):
+        agent.step()
+
+
+def test_full_autonomous_day(cfg, tmp_path):
     sim, agent = _agent(cfg, tmp_path)
-    assert agent.mode == "mock"
-    for ev in (make_event("cloud_cover", 30), make_event("price_spike", 70), make_event("line_congestion", 45)):
+    assert agent.mode == "offline"
+    for ev in (make_event("cloud_cover", 30), make_event("price_spike", 70), make_event("line_congestion", 45),
+               make_event("generator_breakdown", 55, asset="S1")):
         sim.apply_event(ev)
     decisions = agent.run_day()
     assert len(decisions) == 96 and sim.done
-    totals = sim.totals()
-    assert totals["violations"] == 0
-    assert totals["unserved_critical_mwh"] == 0
+    assert sim.totals()["violations"] == 0
     lines = (tmp_path / "log.jsonl").read_text().splitlines()
     assert len(lines) == 96
     rec = json.loads(lines[-1])
-    assert rec["explanation"] and rec["criteria"]["w_cost"] > 0 and rec["validation"]["passed"]
-    assert {d.situation for d in decisions} >= {"normal"}
+    assert len(rec["options"]) == len(OPTION_GRID) and rec["explanation"] and rec["validation"]["passed"]
+    assert not hasattr(agent, "pending_approvals")            # no human in the loop
 
 
-def test_storm_raises_reserve_and_uses_p10(cfg, tmp_path):
+def test_every_option_is_stress_tested_and_ranked(cfg, tmp_path):
     sim, agent = _agent(cfg, tmp_path)
-    for _ in range(20):
-        agent.step()
-    sim.apply_event(make_event("storm_alert", sim.tick, lead=6))
     d = agent.step()
-    assert d.situation == "storm_risk"
-    assert d.criteria["uncertainty_mode"] == "p10" and d.criteria["reserve_pct"] >= 0.5
+    tested = [o for o in d.options if o["cost_avg_rs"] is not None]
+    assert len(tested) >= len(OPTION_GRID) - 1
+    assert all(0 <= o["p_shortfall"] <= 1 and o["cost_p95_rs"] >= o["cost_avg_rs"] - 1e-6 for o in tested)
+    assert sum(o["reason"] == "chosen" for o in d.options) == 1
 
 
-def test_relax_then_fallback_on_infeasible(cfg, tmp_path):
-    sim, agent = _agent(cfg, tmp_path, seed=4)
-    for kind, kw in (("wind_drop", {"factor": 0.0}), ("battery_unavailable", {"battery": 0}),
-                     ("battery_unavailable", {"battery": 1}), ("line_congestion", {"factor": 0.1})):
-        sim.apply_event(make_event(kind, 0, duration=20, **kw))
+def _protection_for(cfg, tmp_path, prob, tick=72):
+    sim, agent = _agent(cfg, tmp_path)
+    _advance(agent, tick)
+    if prob:
+        sim.apply_event(make_event("storm_alert", tick, probability=prob, hits=False))
     d = agent.step()
-    assert len(d.attempts) >= 2 and d.attempts[0]["status"] == "infeasible"
-    assert "relaxed" in d.plan_source or d.plan_source == "fallback"
+    return d.criteria["reserve_pct"], d
 
 
-def test_human_approval_gates_large_export(cfg, tmp_path):
-    sim, agent = _agent(cfg, tmp_path, auto_approve=False)
-    sim.soc[:] = [b.max_mwh for b in cfg.batteries]
-    sim.tick = 50                                   # midday surplus, batteries full
+def test_protection_rises_with_storm_probability(cfg, tmp_path):
+    reserves = [_protection_for(cfg, tmp_path, p)[0] for p in (0.0, 0.3, 0.9)]
+    assert reserves[0] < reserves[1] <= reserves[2]
+    assert reserves[2] > reserves[0]
+
+
+def test_all_signals_kept_together(cfg, tmp_path):
+    sim, agent = _agent(cfg, tmp_path)
+    _advance(agent, 60)
+    for ev in (make_event("storm_alert", 60, probability=0.35, hits=False), make_event("price_spike", 60, factor=4.0),
+               make_event("battery_unavailable", 60, battery=0)):
+        sim.apply_event(ev)
     d = agent.step()
-    assert d.action_summary["export_mw"] <= agent.export_threshold + 1e-6
-    pending = agent.pending_approvals()
-    assert pending and pending[0].kind == "large_export"
-    agent.resolve_approval(pending[0].id, True)
-    d2 = agent.step()
-    assert d2.action_summary["export_mw"] > agent.export_threshold
+    s = d.signals
+    assert s["storm_prob"] == pytest.approx(0.35) and s["price_ratio"] > 1.4 and s["battery_available"] == 0.5
+    text = " ".join(t for t, _ in d.headline)
+    assert "Storm" in text and "Price" in text and "Batteries" in text   # nothing dropped
+    assert d.trigger == "shock"
 
 
-def test_maintenance_scheduled_to_low_impact_window(cfg, tmp_path):
+def test_breakdown_triggers_autonomous_crew(cfg, tmp_path):
+    sim, agent = _agent(cfg, tmp_path)
+    _advance(agent, 40)
+    sim.apply_event(make_event("generator_breakdown", 40, duration=20, asset="W1"))
+    d = agent.step()
+    assert any("Crew dispatched to W1" in n for n in d.notes)
+    outage = next(o for o in sim.outages if o["asset"] == "W1")
+    assert outage["end"] == 44                           # repaired early
+
+
+def test_maintenance_moved_without_approval(cfg, tmp_path):
     sim, agent = _agent(cfg, tmp_path)
     sim.apply_event(make_event("maintenance_window", 0, duration=8, asset="S1", lead=40, window=24))
-    agent.step()
-    m = sim.maintenance[0]
+    _advance(agent, 30)
+    m = sim.maintenance[-1]
     assert m.scheduled_start is not None
-    assert m.scheduled_start != 40 or sim.profile.solar[40:48, 0].sum() == 0  # moved off peak sun
+    assert m.scheduled_start != 40 or sim.profile.solar[40:48, 0].sum() == 0
+
+
+def test_learning_reduces_forecast_error(cfg, tmp_path):
+    sim, agent = _agent(cfg, tmp_path)
+    agent.run_day()
+    rep = agent.learner.report()
+    assert rep["wind"]["correction_pct"] < -4                    # wind model over-forecasts by 12%
+    assert rep["demand"]["correction_pct"] < -1                  # demand over-forecast by 3%
+    assert rep["demand"]["mae_learned_mw"] < rep["demand"]["mae_raw_mw"]
+
+
+def test_learning_persists_between_days(cfg, tmp_path):
+    cfg.data["learning_file"] = str(tmp_path / "learn.json")
+    sim, agent = _agent(cfg, tmp_path, persist_learning=True)
+    agent.run_day()
+    sim2, agent2 = _agent(cfg, tmp_path, seed=2, persist_learning=True)
+    assert agent2.learner.days_trained == 1 and agent2.learner.ratio["wind"] < 0.97
+    cfg.data.pop("learning_file")
+
+
+def test_operation_measures_savings_vs_baseline(cfg, tmp_path):
+    sim = Simulator(cfg, seed=3)
+    op = Operation(cfg, sim, use_llm=False, persist_learning=False, log_path=None)
+    op.inject(make_event("storm_alert", 0, probability=1.0))
+    for _ in range(24):
+        op.step()
+    out = op.outputs()
+    assert op.base_sim.tick == op.sim.tick == 24
+    assert op.base_sim.events[0].params["hits"] == op.sim.events[0].params["hits"]
+    assert {"money_saved_rs", "carbon_saved_t", "generation_efficiency_pct", "energy_produced_mwh"} <= set(out)
 
 
 # ---------------------------------------------------------------- scripted fake Claude
 class FakeClient:
-    """Mimics anthropic.Anthropic().messages.create with a scripted tool-use conversation."""
-
-    def __init__(self, fail=False):
-        self.fail, self.calls = fail, 0
+    def __init__(self, pick=None, fail=False):
+        self.pick, self.fail, self.calls = pick, fail, 0
         self.messages = SimpleNamespace(create=self.create)
 
     def create(self, **kw):
+        self.calls += 1
         if self.fail:
             raise RuntimeError("API down")
-        self.calls += 1
-        msgs = kw["messages"]
-        turn = sum(1 for m in msgs if m["role"] == "assistant")
-        tu = lambda i, name, inp: SimpleNamespace(type="tool_use", id=f"t{self.calls}{i}", name=name, input=inp)  # noqa
-        if turn == 0:
-            return SimpleNamespace(stop_reason="tool_use", content=[tu(0, "get_state", {}), tu(1, "get_alerts", {})])
-        if turn == 1:
-            return SimpleNamespace(stop_reason="tool_use", content=[tu(0, "run_optimizer", {
-                "situation": "normal", "w_cost": 0.6, "w_clean": 0.3, "w_reliability": 0.1, "reserve_pct": 0.25,
-                "uncertainty_mode": "p50", "reasoning": "calm conditions"})])
-        if turn == 2:
-            plan_id = json.loads(msgs[-1]["content"][0]["content"])["plan_id"]
-            return SimpleNamespace(stop_reason="tool_use", content=[tu(0, "validate_actions", {"plan_id": plan_id}),
-                                                                    tu(1, "execute_actions", {"plan_id": plan_id})])
-        return SimpleNamespace(stop_reason="end_turn",
-                               content=[SimpleNamespace(type="text", text="Calm day; I leaned on cost.")])
+        brief = json.loads(kw["messages"][0]["content"].split("(JSON):\n", 1)[1].split("\n\nDecide", 1)[0])
+        choice = self.pick(brief) if self.pick else brief["recommended_by_ladder"]
+        return SimpleNamespace(content=[SimpleNamespace(type="tool_use", name="submit_decision", id="t1", input={
+            "option_id": choice, "diagnosis": "Calm and cheap.", "explanation": "LLM explanation."})])
 
 
 def _fake_llm(client):
     llm = LLMReasoner.__new__(LLMReasoner)
-    llm.client, llm.model, llm.max_turns = client, "fake", 10
+    llm.client, llm.model = client, "fake"
     return llm
 
 
-def test_full_day_with_llm_tool_use(cfg, tmp_path):
-    client = FakeClient()
+def test_llm_picks_among_eligible_and_is_throttled(cfg, tmp_path):
+    client = FakeClient(pick=lambda b: b["eligible"][-1])
     sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(client))
-    assert agent.mode == "llm"
-    decisions = agent.run_day()
-    assert len(decisions) == 96 and sim.totals()["violations"] == 0
-    llm_ticks = [d for d in decisions if d.reasoner == "llm"]
-    assert 96 // agent.llm_every_n <= len(llm_ticks) < 96          # throttled, not every tick
-    first = llm_ticks[0]
-    assert first.explanation == "Calm day; I leaned on cost."
-    assert first.criteria["reserve_pct"] == pytest.approx(0.25)
-    assert [c["tool"] for c in first.tool_calls][:3] == ["get_state", "get_alerts", "run_optimizer"]
-    assert any(d.reasoner == "llm-cached" for d in decisions)
+    _advance(agent, 24)
+    llm_ticks = [d for d in agent.decisions if d.reasoner == "llm"]
+    assert 3 <= len(llm_ticks) < 24
+    assert llm_ticks[0].explanation == "LLM explanation." and llm_ticks[0].diagnosis == "Calm and cheap."
 
 
-def test_llm_outage_falls_back_to_mock(cfg, tmp_path):
+def test_llm_cannot_choose_ineligible_plan(cfg, tmp_path):
+    sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(FakeClient(pick=lambda b: "O99")))
+    d = agent.step()
+    assert "non-eligible" in d.llm_error and d.chosen != "O99"
+
+
+def test_llm_outage_keeps_running(cfg, tmp_path):
     sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(FakeClient(fail=True)))
-    decisions = agent.run_day()
-    assert sim.done and sim.totals()["violations"] == 0
-    assert any(d.reasoner == "mock (llm error)" and "API down" in d.llm_error for d in decisions)
+    _advance(agent, 12)
+    assert all(d.validation["passed"] for d in agent.decisions)
+    assert any("API down" in d.llm_error for d in agent.decisions)

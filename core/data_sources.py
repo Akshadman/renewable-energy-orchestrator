@@ -2,11 +2,12 @@
 
 Three interchangeable :class:`WeatherProvider` implementations feed the digital twin:
 
-* :class:`OpenMeteoProvider` — live 15-minute data (``minutely_15``) from api.open-meteo.com
-* :class:`ReplayProvider`    — a cached CSV of a past day (``data/replay/*.csv``)
-* :class:`SyntheticProvider` — statistically generated weather (the original simulator)
+* :class:`OpenMeteoProvider`   — live 15-minute data (``minutely_15``) from api.open-meteo.com
+* :class:`LastYearProvider`    — proxy: the same calendar date one year earlier (Open-Meteo archive)
+* :class:`ReplayProvider`      — a cached CSV of a past day (``data/replay/*.csv``)
+* :class:`SyntheticProvider`   — statistically generated weather (the original simulator)
 
-:func:`load_weather_day` applies the fallback chain OpenMeteo → Replay → Synthetic and
+:func:`load_weather_day` applies the fallback chain Live → Last year → Replay → Synthetic and
 reports which source is actually active. Prices come from ``data/iex_prices.csv``
 (15-minute IEX blocks); a sample file is generated if it is missing.
 """
@@ -33,8 +34,11 @@ log = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OM_VARS = ["shortwave_radiation", "wind_speed_100m", "cloud_cover", "weather_code"]
-SOURCES = ["openmeteo", "replay", "synthetic"]
+SOURCES = ["openmeteo", "lastyear", "replay", "synthetic"]
+SOURCE_LABELS = {"openmeteo": "Live forecast (Open-Meteo, 15-min)", "lastyear": "Proxy: same day last year",
+                 "replay": "Replay (saved day)", "synthetic": "Synthetic (simulated weather)"}
 
 
 class DataSourceError(RuntimeError):
@@ -122,18 +126,10 @@ class OpenMeteoProvider(WeatherProvider):
         self._get = http_get
         self.last_from_cache = False
 
+    url = OPEN_METEO_URL
+
     def get_day(self, config: Config, day: Date, seed: int = 0) -> WeatherDay:
-        sites = [(f.lat, f.lon) for f in config.solar] + [(f.lat, f.lon) for f in config.wind]
-        params = {
-            "latitude": ",".join(f"{lat:.4f}" for lat, _ in sites),
-            "longitude": ",".join(f"{lon:.4f}" for _, lon in sites),
-            "minutely_15": ",".join(OM_VARS),
-            "wind_speed_unit": "ms",
-            "timezone": "Asia/Kolkata",
-            "start_date": day.isoformat(),
-            "end_date": day.isoformat(),
-        }
-        payload = self._fetch_cached(params, permanent=day < today_ist())
+        payload = self._fetch_cached(self._params(config, day), permanent=day < today_ist())
         wd = parse_open_meteo(payload, config, day)
         try:
             save_replay_csv(wd, config, self.replay_dir)
@@ -141,9 +137,19 @@ class OpenMeteoProvider(WeatherProvider):
             log.warning("could not write replay CSV: %s", exc)
         return wd
 
+    @staticmethod
+    def _sites(config: Config) -> Dict[str, str]:
+        sites = [(f.lat, f.lon) for f in config.solar] + [(f.lat, f.lon) for f in config.wind]
+        return {"latitude": ",".join(f"{lat:.4f}" for lat, _ in sites),
+                "longitude": ",".join(f"{lon:.4f}" for _, lon in sites)}
+
+    def _params(self, config: Config, day: Date) -> Dict[str, str]:
+        return {**self._sites(config), "minutely_15": ",".join(OM_VARS), "wind_speed_unit": "ms",
+                "timezone": "Asia/Kolkata", "start_date": day.isoformat(), "end_date": day.isoformat()}
+
     def _fetch_cached(self, params: Dict[str, str], permanent: bool) -> Any:
-        key = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
-        path = self.cache_dir / f"openmeteo_{params['start_date']}_{key}.json"
+        key = hashlib.sha1(json.dumps([self.url, params], sort_keys=True).encode()).hexdigest()[:16]
+        path = self.cache_dir / f"{self.name}_{params['start_date']}_{key}.json"
         if path.exists():
             cached = json.loads(path.read_text())
             if permanent or time.time() - cached.get("fetched_at", 0) < self.ttl_s:
@@ -152,16 +158,34 @@ class OpenMeteoProvider(WeatherProvider):
         self.last_from_cache = False
         get = self._get or _requests_get
         try:
-            resp = get(OPEN_METEO_URL, params=params, timeout=self.timeout_s)
+            resp = get(self.url, params=params, timeout=self.timeout_s)
             resp.raise_for_status()
             payload = resp.json()
         except Exception as exc:  # network, HTTP, JSON — all mean "API unavailable"
-            raise DataSourceError(f"Open-Meteo request failed: {exc}") from exc
+            raise DataSourceError(f"{self.name} request failed: {exc}") from exc
         if isinstance(payload, dict) and payload.get("error"):
             raise DataSourceError(f"Open-Meteo error: {payload.get('reason')}")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"fetched_at": time.time(), "params": params, "payload": payload}))
         return payload
+
+
+class LastYearProvider(OpenMeteoProvider):
+    """Proxy data set: the same calendar date one year earlier from the Open-Meteo archive (hourly,
+    interpolated to 15 min). Used when the live forecast is unavailable."""
+
+    name = "lastyear"
+    url = ARCHIVE_URL
+
+    def get_day(self, config: Config, day: Date, seed: int = 0) -> WeatherDay:
+        proxy = _one_year_earlier(day)
+        params = {**self._sites(config), "hourly": ",".join(OM_VARS), "wind_speed_unit": "ms",
+                  "timezone": "Asia/Kolkata", "start_date": proxy.isoformat(), "end_date": proxy.isoformat()}
+        payload = self._fetch_cached(params, permanent=True)
+        wd = parse_open_meteo(_hourly_to_15min(payload), config, proxy)
+        wd.source = self.name
+        wd.notes.append(f"proxy weather from {proxy.isoformat()} (one year earlier)")
+        return wd
 
 
 class ReplayProvider(WeatherProvider):
@@ -210,6 +234,9 @@ def make_provider(name: str, config: Config) -> WeatherProvider:
     if name == "openmeteo":
         return OpenMeteoProvider(resolve_path(d.get("cache_dir", "data/cache")), d.get("cache_ttl_minutes", 60),
                                  d.get("api_timeout_s", 10), resolve_path(d.get("replay_dir", "data/replay")))
+    if name == "lastyear":
+        return LastYearProvider(resolve_path(d.get("cache_dir", "data/cache")), d.get("cache_ttl_minutes", 60),
+                                d.get("api_timeout_s", 10), resolve_path(d.get("replay_dir", "data/replay")))
     if name == "replay":
         return ReplayProvider(resolve_path(d.get("replay_dir", "data/replay")))
     if name == "synthetic":
@@ -219,7 +246,7 @@ def make_provider(name: str, config: Config) -> WeatherProvider:
 
 def load_weather_day(source: str, config: Config, day: Optional[Date] = None, seed: int = 0,
                      providers: Optional[Dict[str, WeatherProvider]] = None) -> WeatherDay:
-    """Load weather from ``source``, falling back OpenMeteo → Replay → Synthetic.
+    """Load weather from ``source``, falling back Live → Last year → Replay → Synthetic.
 
     The returned :attr:`WeatherDay.source` names the provider that actually succeeded and
     :attr:`WeatherDay.notes` explains any fallback.
@@ -301,8 +328,14 @@ def weather_alerts(wd: WeatherDay, config: Config, tick: int, horizon: int = 16)
             high_wind = speed_s is not None and speed_s[t] >= wind_thr
             if storm_code or high_wind:
                 why = f"WMO code {int(code_s[t])}" if storm_code else f"wind {speed_s[t]:.1f} m/s"
-                alerts.append(Alert("storm_alert", tick, f"Storm risk at {name} ({why}) in {(t - tick) * 15} min",
-                                    "critical" if t - tick <= 4 else "warning", t - tick))
+                lead = t - tick
+                end_t = t
+                while end_t < wd.ticks and (int(code_s[end_t]) in codes or
+                                            (speed_s is not None and speed_s[end_t] >= wind_thr)):
+                    end_t += 1
+                prob = round(max(0.4, 0.9 - 0.03 * lead), 2)   # forecast confidence decays with lead time
+                alerts.append(Alert("storm_alert", tick, f"Storm risk {prob:.0%} at {name} ({why}) in {lead * 15} min",
+                                    "critical" if lead <= 4 else "warning", lead, prob, max(1, end_t - t)))
                 break
     return alerts
 
@@ -367,3 +400,29 @@ def _codes_from_cloud(cloud: np.ndarray, rng: np.random.Generator) -> np.ndarray
 def _requests_get(url: str, **kw: Any) -> Any:
     import requests  # local import keeps tests independent of the network stack
     return requests.get(url, **kw)
+
+
+def _one_year_earlier(day: Date) -> Date:
+    try:
+        return day.replace(year=day.year - 1)
+    except ValueError:  # 29 Feb
+        return day.replace(year=day.year - 1, day=28)
+
+
+def _hourly_to_15min(payload: Any) -> Any:
+    """Convert an archive (hourly) response into the minutely_15 shape :func:`parse_open_meteo` expects."""
+    locs = payload if isinstance(payload, list) else [payload]
+    out = []
+    for loc in locs:
+        h = loc.get("hourly") or {}
+        if not h.get("time"):
+            raise DataSourceError("archive response has no hourly data")
+        n = len(h["time"])
+        x_h, x_q = np.arange(n) * 4.0, np.arange(n * 4)
+        block: Dict[str, Any] = {"time": [f"{t[:-2]}{m:02d}" for t in h["time"] for m in (0, 15, 30, 45)]}
+        for v in OM_VARS:
+            vals = pd.Series(np.array(h.get(v) or [np.nan] * n, dtype=float)).interpolate(limit_direction="both")
+            arr = np.interp(x_q, x_h, vals.fillna(0).to_numpy())
+            block[v] = (np.repeat(vals.fillna(0).to_numpy(), 4) if v == "weather_code" else arr).tolist()
+        out.append({**{k: v for k, v in loc.items() if k != "hourly"}, "minutely_15": block})
+    return out

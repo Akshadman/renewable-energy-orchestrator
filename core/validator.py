@@ -71,7 +71,8 @@ def validate(action: Action, state: GridState, config: Config, balance_tol_mw: f
 
     if a.shed_mw.sum() > TOL:
         w.append(f"sheds {a.shed_mw.sum():.1f} MW of flexible load")
-    reserve = sum(state.soc_mwh) / sum(b.energy_mwh for b in config.batteries)
+    fleet = sum(b.energy_mwh for b in config.batteries)
+    reserve = sum(state.soc_mwh) / fleet if fleet else 1.0
     if reserve < 0.15:
         w.append(f"fleet SoC low ({reserve:.0%})")
     return ValidationResult(not v, v, w)

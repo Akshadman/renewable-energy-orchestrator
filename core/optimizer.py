@@ -62,17 +62,24 @@ class OptimizerResult:
 
 
 def optimize(state: GridState, forecast: Forecast, config: Config, criteria: Criteria,
-             time_limit_s: float = 10.0) -> OptimizerResult:
-    """Solve the horizon MILP and return the first-tick dispatch. Never raises."""
+             time_limit_s: float = 10.0, soc_target_mwh: Optional[float] = None,
+             relax_binaries: bool = False) -> OptimizerResult:
+    """Solve the horizon MILP and return the first-tick dispatch. Never raises.
+
+    ``soc_target_mwh`` — day-ahead plan's fleet energy at the end of this horizon (soft target).
+    ``relax_binaries`` — solve as an LP (fast; used for the 24 h day-ahead backbone).
+    """
     t0 = time.perf_counter()
     try:
-        return _solve(state, forecast, config, criteria.normalized(), time_limit_s, t0)
+        return _solve(state, forecast, config, criteria.normalized(), time_limit_s, t0, soc_target_mwh,
+                      relax_binaries)
     except Exception as exc:  # solver crash, bad data — report, don't raise
         return OptimizerResult("error", None, message=f"optimizer error: {exc!r}",
                                solve_time_s=time.perf_counter() - t0, criteria=criteria)
 
 
-def _solve(st: GridState, fc: Forecast, cfg: Config, cr: Criteria, limit: float, t0: float) -> OptimizerResult:
+def _solve(st: GridState, fc: Forecast, cfg: Config, cr: Criteria, limit: float, t0: float,
+           soc_target: Optional[float] = None, relax_binaries: bool = False) -> OptimizerResult:
     H, dt, m = fc.horizon, TICK_HOURS, cfg.market
     B, S, W, C = range(len(cfg.batteries)), range(len(cfg.solar)), range(len(cfg.wind)), range(len(cfg.consumers))
     T = range(H)
@@ -104,11 +111,12 @@ def _solve(st: GridState, fc: Forecast, cfg: Config, cr: Criteria, limit: float,
     V = pulp.LpVariable
     ch = {(b, t): V(f"ch_{b}_{t}", 0, cfg.batteries[b].power_mw * avail[t, b]) for b in B for t in T}
     dis = {(b, t): V(f"dis_{b}_{t}", 0, cfg.batteries[b].power_mw * avail[t, b]) for b in B for t in T}
-    mode = {(b, t): V(f"u_{b}_{t}", cat="Binary") for b in B for t in T}
+    bin_kw = {"lowBound": 0, "upBound": 1} if relax_binaries else {"cat": "Binary"}
+    mode = {(b, t): V(f"u_{b}_{t}", **bin_kw) for b in B for t in T}
     soc = {(b, t): V(f"soc_{b}_{t}", cfg.batteries[b].min_mwh, cfg.batteries[b].max_mwh) for b in B for t in T}
     imp = {t: V(f"imp_{t}", 0, imp_lim[t]) for t in T}
     exp = {t: V(f"exp_{t}", 0, exp_lim[t]) for t in T}
-    gdir = {t: V(f"g_{t}", cat="Binary") for t in T}
+    gdir = {t: V(f"g_{t}", **bin_kw) for t in T}
     cs = {(s, t): V(f"cs_{s}_{t}", 0, solar[t, s]) for s in S for t in T}
     cw = {(w, t): V(f"cw_{w}_{t}", 0, wind[t, w]) for w in W for t in T}
     dr = {(c, t): V(f"dr_{c}_{t}", 0, flex[t, c] * elig[c]) for c in C for t in T}
@@ -136,11 +144,16 @@ def _solve(st: GridState, fc: Forecast, cfg: Config, cr: Criteria, limit: float,
         p += pulp.lpSum(soc[b, t] * avail[t, b] for b in B) + rs[t] >= floor
 
     ci = cfg.grid.carbon_intensity_t_per_mwh
-    terminal_value = float(np.mean(mcp)) * float(np.mean([b.round_trip_eff for b in cfg.batteries]))
+    terminal_value = float(np.mean(mcp)) * (float(np.mean([b.round_trip_eff for b in cfg.batteries]))
+                                            if cfg.batteries else 0.0)
+    short = V("terminal_short", 0)
+    if soc_target is not None and cfg.batteries:
+        p += pulp.lpSum(soc[b, H - 1] for b in B) + short >= float(soc_target)
     cost = (pulp.lpSum(dt * (buy[t] * imp[t] - sell[t] * exp[t]) for t in T)
             + pulp.lpSum(dt * cfg.batteries[b].degradation_cost * (ch[b, t] + dis[b, t]) for b in B for t in T)
             + pulp.lpSum(dt * m.dr_incentive * dr[c, t] + dt * m.voll_flexible * shed[c, t] for c in C for t in T)
-            - pulp.lpSum(terminal_value * soc[b, H - 1] for b in B))
+            - pulp.lpSum(terminal_value * soc[b, H - 1] for b in B)
+            + float(np.mean(buy)) * short)
     clean = (pulp.lpSum(dt * m.curtailment_penalty * (cs[s, t]) for s in S for t in T)
              + pulp.lpSum(dt * m.curtailment_penalty * (cw[w, t]) for w in W for t in T)
              + pulp.lpSum(dt * m.carbon_price * ci * imp[t] for t in T))
@@ -167,8 +180,10 @@ def _solve(st: GridState, fc: Forecast, cfg: Config, cr: Criteria, limit: float,
         unserved_critical_mw=np.array([val(uc[c, 0]) for c in C]), source="optimizer",
     )
     _clean_small(action)
+    fleet = sum(b.energy_mwh for b in cfg.batteries) or 1.0
     plan = {
-        "soc_pct": [sum(val(soc[b, t]) for b in B) / sum(b.energy_mwh for b in cfg.batteries) * 100 for t in T],
+        "soc_pct": [sum(val(soc[b, t]) for b in B) / fleet * 100 for t in T],
+        "soc_mwh": [sum(val(soc[b, t]) for b in B) for t in T],
         "net_battery_mw": [sum(val(dis[b, t]) - val(ch[b, t]) for b in B) for t in T],
         "net_grid_mw": [val(imp[t]) - val(exp[t]) for t in T],
         "curtail_mw": [sum(val(cs[s, t]) for s in S) + sum(val(cw[w, t]) for w in W) for t in T],

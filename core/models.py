@@ -103,6 +103,10 @@ class Config:
     sim: Dict[str, Any]
     agent: Dict[str, Any]
     data: Dict[str, Any]
+    targets: Dict[str, Any] = field(default_factory=dict)        # industry goals (carbon, cost, risk)
+    schedules: Dict[str, Any] = field(default_factory=dict)      # maintenance / breakdowns / conservation
+    custom_profiles: Dict[str, List[float]] = field(default_factory=dict)  # consumer id -> 96 MW values
+    name: str = "Default portfolio"
 
     @property
     def ticks_per_day(self) -> int:
@@ -229,6 +233,8 @@ class Alert:
     message: str
     severity: str = "warning"     # info | warning | critical
     eta_ticks: int = 0             # how far ahead the condition is expected
+    probability: float = 1.0       # chance the condition materialises
+    duration_ticks: int = 0        # expected length once it starts
 
 
 @dataclass

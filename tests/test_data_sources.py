@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.data_sources import (DataSourceError, OpenMeteoProvider, ReplayProvider, SyntheticProvider, ensure_iex_csv,
+from core.data_sources import (DataSourceError, LastYearProvider, OpenMeteoProvider, ReplayProvider, SyntheticProvider, ensure_iex_csv,
                                load_iex_prices, load_weather_day, parse_open_meteo, save_replay_csv, weather_alerts)
 from core.simulator import Simulator
 
@@ -54,6 +54,31 @@ def _om(tmp_path, http):
     return OpenMeteoProvider(cache_dir=tmp_path / "cache", replay_dir=tmp_path / "replay", http_get=http)
 
 
+def _ly(tmp_path, http):
+    return LastYearProvider(cache_dir=tmp_path / "cache_ly", replay_dir=tmp_path / "replay_ly", http_get=http)
+
+
+def fake_hourly(cfg):
+    """Open-Meteo archive-shaped response (24 hourly values per site)."""
+    h = np.arange(24)
+    ghi = np.clip(850 * np.sin(np.pi * (h - 6.2) / 12.4), 0, None).round(1).tolist()
+    return [{"latitude": 0, "longitude": 0, "hourly": {
+        "time": [f"2025-09-20T{x:02d}:00" for x in h], "shortwave_radiation": ghi,
+        "wind_speed_100m": [7.0] * 24, "cloud_cover": [20] * 24, "weather_code": [1] * 24}}
+        for _ in range(len(cfg.solar) + len(cfg.wind))]
+
+
+def test_live_failure_uses_last_year_proxy(cfg, tmp_path):
+    http = FakeHTTP(fake_hourly(cfg))
+    providers = {"openmeteo": _om(tmp_path, FakeHTTP(exc=ConnectionError("offline"))),
+                 "lastyear": _ly(tmp_path, http)}
+    wd = load_weather_day("openmeteo", cfg, DAY, providers=providers)
+    assert wd.source == "lastyear" and wd.date == "2025-09-20"
+    assert http.calls[0]["start_date"] == "2025-09-20" and "hourly" in http.calls[0]
+    assert wd.irradiance.shape == (96, len(cfg.solar)) and wd.irradiance[48].min() > 700
+    assert any("one year earlier" in n for n in wd.notes)
+
+
 def test_open_meteo_parse_and_request(cfg, tmp_path):
     http = FakeHTTP(fake_payload(cfg))
     wd = _om(tmp_path, http).get_day(cfg, DAY)
@@ -87,7 +112,8 @@ def test_expired_cache_refetches_for_today(cfg, tmp_path):
 def test_api_failure_falls_back_to_replay(cfg, tmp_path, http):
     replay_dir = tmp_path / "replay"
     save_replay_csv(SyntheticProvider().get_day(cfg, DAY, seed=3), cfg, replay_dir)
-    providers = {"openmeteo": _om(tmp_path, http), "replay": ReplayProvider(replay_dir)}
+    providers = {"openmeteo": _om(tmp_path, http), "lastyear": _ly(tmp_path, FakeHTTP(exc=OSError("down"))),
+                 "replay": ReplayProvider(replay_dir)}
     wd = load_weather_day("openmeteo", cfg, DAY, providers=providers)
     assert wd.source == "replay"
     assert any("openmeteo failed" in n for n in wd.notes) and any("using 'replay'" in n for n in wd.notes)
@@ -95,9 +121,10 @@ def test_api_failure_falls_back_to_replay(cfg, tmp_path, http):
 
 def test_falls_back_to_synthetic_when_no_replay(cfg, tmp_path):
     providers = {"openmeteo": _om(tmp_path, FakeHTTP(exc=TimeoutError("slow"))),
+                 "lastyear": _ly(tmp_path, FakeHTTP(exc=TimeoutError("slow"))),
                  "replay": ReplayProvider(tmp_path / "empty")}
     wd = load_weather_day("openmeteo", cfg, DAY, providers=providers)
-    assert wd.source == "synthetic" and len(wd.notes) >= 3
+    assert wd.source == "synthetic" and len(wd.notes) >= 4
 
 
 def test_malformed_payload_rejected(cfg):
@@ -129,19 +156,20 @@ def test_storm_alerts_from_weather_code_and_wind(cfg):
     wd = parse_open_meteo(fake_payload(cfg, storm_site=0), cfg, DAY)
     alerts = weather_alerts(wd, cfg, tick=56, horizon=16)
     assert len(alerts) == 1 and "WMO code 95" in alerts[0].message and alerts[0].eta_ticks == 4
+    assert 0.4 <= alerts[0].probability <= 0.9 and alerts[0].duration_ticks == 10
     windy = parse_open_meteo(fake_payload(cfg, wind=22.0), cfg, DAY)
     assert sum("wind 22.0" in a.message for a in weather_alerts(windy, cfg, 0)) == len(cfg.wind)
     assert weather_alerts(parse_open_meteo(fake_payload(cfg), cfg, DAY), cfg, 0) == []
 
 
-def test_storm_code_drives_agent_situation(cfg, tmp_path, monkeypatch):
+def test_storm_code_raises_agent_storm_signal(cfg, tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     from agent.agent import OrchestratorAgent
     wd = parse_open_meteo(fake_payload(cfg, storm_site=6), cfg, DAY)
     sim = Simulator(cfg, weather=wd, day=DAY)
     sim.tick = 55
     d = OrchestratorAgent(sim, cfg, log_path=None).step()
-    assert d.situation == "storm_risk"
+    assert d.signals["storm_prob"] > 0.5 and d.signals["storm_eta_min"] == 75
 
 
 def test_iex_sample_generated_and_loaded(tmp_path):

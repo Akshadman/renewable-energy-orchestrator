@@ -1,4 +1,5 @@
-# Renewable Energy Orchestrator — asset & market configuration.
+# Renewable Energy Orchestrator — asset & market configuration (the default industry profile).
+name: Default portfolio
 # Units: power MW, energy MWh, prices ₹/MWh, carbon tCO2/MWh, time in 15-min ticks.
 
 sim:
@@ -8,6 +9,7 @@ sim:
   frequency_nominal_hz: 50.0
   frequency_sensitivity_hz: 0.5     # Hz deviation per 100% supply/demand imbalance
   nowcast_error: 0.03               # realised vs. nowcast error on renewables (fraction)
+  forecast_bias: {solar: -0.04, wind: 0.12, demand: 0.03}   # systematic NWP/model bias the agent must learn
 
 solar_farms:   # Rajasthan / Gujarat
   - {id: S1, name: Bhadla (RJ),        capacity_mw: 60, lat: 27.54, lon: 71.92, performance_ratio: 0.90, cloud_sensitivity: 1.0}
@@ -32,7 +34,7 @@ consumers:     # base_mw = typical load; critical_frac must always be served
   - {id: C4, name: Data centre,    base_mw: 30, critical_frac: 0.90, dr_eligible: false, profile: flat}
 
 grid:
-  import_limit_mw: 90
+  import_limit_mw: 120
   export_limit_mw: 70
   carbon_intensity_t_per_mwh: 0.72   # Indian grid average
 
@@ -51,9 +53,9 @@ market:
 agent:
   horizon: 16                  # optimizer look-ahead (ticks)
   llm_every_n_ticks: 8         # re-consult LLM at least this often
-  export_approval_mw: 50       # exports above this need human approval
-  permission_ticks: 8          # approval/rejection holds for this many ticks
   max_relax_attempts: 2
+  scenarios: 100               # stress-test futures per candidate plan
+  learning_rate: 0.15          # EMA step for forecast-bias learning
 
 data:
   iex_prices_csv: data/iex_prices.csv
@@ -63,3 +65,16 @@ data:
   api_timeout_s: 10
   storm_weather_codes: [95, 96, 99, 65, 67, 82]   # thunderstorm / heavy rain
   storm_wind_ms: 20.0          # alert when hub-height wind exceeds this
+  learning_file: data/learning.json
+
+targets:                       # industry goals
+  annual_carbon_target_t: 250000
+  target_cost_rs_per_mwh: 4500
+  max_shortfall_prob: 0.02     # tolerated chance of critical-load shortfall in the next 4 h
+  risk_aversion: 0.3           # 0 = only average cost matters, 1 = worst case matters as much
+
+schedules:
+  maintenance:                 # planned work; the agent may move "flexible" jobs inside their window
+    - {asset: W3, start: "14:00", hours: 2, kind: maintenance, flexible_hours: 4}
+  conservation:                # planned demand reduction by the industry
+    - {start: "18:30", end: "20:00", reduction_pct: 5}

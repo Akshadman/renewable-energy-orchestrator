@@ -1,58 +1,95 @@
-"""Orchestrator agent: perceive → assess → set criteria → optimize → validate → act → explain."""
+"""Autonomous orchestrator.
+
+Every 15 minutes (and immediately after any shock), with a day-ahead plan as the backbone:
+
+  PERCEIVE    state, learned-corrected P10/P50/P90 forecasts, prices, alerts (with probabilities)
+  DIAGNOSE    continuous risk signals, all measured together (no situation labels)
+  OPTIONS     the MILP optimizer produces a spread of candidate plans (cheapest … safest)
+  STRESS-TEST each plan is replayed across ~100 sampled futures → avg ₹, worst-case ₹, P(shortfall)
+  CHOOSE      priority ladder with thresholds: Safety > Reliability (≤ tolerance) > Cost vs Clean
+              (weighted by industry targets) > Battery life; optional LLM may pick among eligible plans
+  VERIFY      validator; if nothing passes → repair (relax) → retry → safe fallback
+  ACT+EXPLAIN execute autonomously, log, 2–3 sentence reason
+  LEARN       compare forecasts with outcomes, correct bias & band width, persist at end of day
+"""
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field, replace
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from agent.mock_reasoner import MockReasoner
+from agent.narrator import diagnosis_text, explain
 from agent.prompts import SYSTEM_PROMPT, tick_brief
-from agent.tools import ToolBox
-from core.config import ROOT
+from agent.signals import Signals, diagnose
+from agent.stress_test import StressResult, sample_futures, stress_test
+from agent.tools import SUBMIT_DECISION, build_briefing
+from core.config import ROOT, resolve_path
 from core.fallback import safe_action
 from core.forecaster import Forecaster
+from core.learning import ForecastLearner
 from core.models import Action, Config, Forecast, GridState, jsonable
-from core.optimizer import Criteria, optimize
-from core.simulator import Simulator
+from core.optimizer import Criteria, OptimizerResult, optimize
+from core.simulator import Simulator, clock
 from core.validator import ValidationResult, validate
 
 DEFAULT_LOG = ROOT / "logs" / "decisions.jsonl"
 DEFAULT_MODEL = "claude-sonnet-5"
 
+# Candidate plans: a fine ladder of protection levels (battery reserve 10% → 85%) with weights that
+# shift smoothly from cost-lean to reliability-lean, plus one green-lean plan. The stress test scores
+# every rung against the *probabilities* of the futures, so the chosen protection rises gradually as
+# risk rises instead of jumping between fixed cases.
+def _rung(reserve: float) -> Criteria:
+    x = (reserve - 0.10) / 0.75                      # 0 at the cheapest rung, 1 at the safest
+    return Criteria(0.65 - 0.50 * x, 0.20 - 0.10 * x, 0.15 + 0.60 * x, reserve, "p10" if reserve >= 0.5 else "p50")
+
+
+OPTION_GRID: List[Tuple[str, Criteria]] = [
+    ("Max savings", _rung(0.10)),
+    ("Lean", _rung(0.20)),
+    ("Balanced", _rung(0.30)),
+    ("Green-lean", Criteria(0.30, 0.55, 0.15, 0.30, "p50")),
+    ("Steady", _rung(0.40)),
+    ("Cautious", _rung(0.50)),
+    ("Protective", _rung(0.62)),
+    ("Strong reserve", _rung(0.74)),
+    ("Fortress", _rung(0.85)),
+]
+
 
 # ---------------------------------------------------------------- records
 @dataclass
-class Plan:
-    """A candidate dispatch for the current tick with its provenance."""
-
+class Option:
     id: str
-    tick: int
+    name: str
     criteria: Criteria
-    action: Action
-    source: str                      # optimizer | optimizer (relaxed xN) | fallback
-    validation: ValidationResult
-    attempts: List[Dict[str, Any]] = field(default_factory=list)
-    objective: Dict[str, float] = field(default_factory=dict)
+    result: OptimizerResult
+    validation: Optional[ValidationResult] = None
+    stress: Optional[StressResult] = None
+    status: str = "invalid"           # eligible | too risky | invalid
+    reason: str = ""
+    score: float = float("inf")
 
-    def summary(self) -> Dict[str, Any]:
-        """What the LLM sees after run_optimizer."""
-        return jsonable({"plan_id": self.id, "source": self.source, "attempts": self.attempts,
-                         "objective": self.objective, "first_tick": describe_action(self.action),
-                         "validation_passed": self.validation.passed})
+    @property
+    def action(self) -> Optional[Action]:
+        return self.result.action
 
-
-@dataclass
-class ApprovalRequest:
-    id: str
-    tick: int
-    kind: str                        # load_shedding | large_export | delay_maintenance | custom
-    reason: str
-    details: Dict[str, Any] = field(default_factory=dict)
-    status: str = "pending"          # pending | approved | rejected | auto-approved
+    def row(self) -> Dict[str, Any]:
+        s = self.stress
+        return jsonable({
+            "id": self.id, "name": self.name, "reserve_pct": self.criteria.reserve_pct,
+            "forecast": self.criteria.uncertainty_mode, "status": self.status, "reason": self.reason,
+            "cost_avg_rs": s.cost_avg if s else None, "cost_p95_rs": s.cost_p95 if s else None,
+            "p_shortfall": s.p_shortfall if s else None, "co2_t": s.co2_t if s else None,
+            "curtailed_mwh": s.curtailed_mwh if s else None, "battery_wear_mwh": s.battery_throughput_mwh if s else None,
+            "score": None if not np.isfinite(self.score) else self.score,
+            "first_tick": describe_action(self.action) if self.action is not None else None,
+        })
 
 
 @dataclass
@@ -61,21 +98,23 @@ class Decision:
 
     tick: int
     hour: float
-    situation: str
-    signals: List[str]
-    reasoner: str
+    time: str
+    trigger: str                       # scheduled | shock
+    signals: Dict[str, Any]
+    headline: List[List[str]]
+    diagnosis: str
+    options: List[Dict[str, Any]]
+    chosen: str
+    chosen_name: str
     criteria: Dict[str, Any]
-    criteria_reason: str
     plan_source: str
-    attempts: List[Dict[str, Any]]
+    reasoner: str
     validation: Dict[str, Any]
     action: Dict[str, Any]
     action_summary: Dict[str, Any]
-    approvals: List[str]
     notes: List[str]
     explanation: str
     kpi: Dict[str, Any]
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     llm_error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -84,51 +123,46 @@ class Decision:
 
 # ---------------------------------------------------------------- LLM
 class LLMReasoner:
-    """Claude tool-use loop. Only consulted when the situation changes or every N ticks."""
+    """Claude picks among eligible, stress-tested plans and explains (one forced tool call)."""
 
     name = "llm"
 
-    def __init__(self, api_key: str, model: Optional[str] = None, max_turns: int = 10) -> None:
+    def __init__(self, api_key: str, model: Optional[str] = None) -> None:
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model or os.environ.get("LLM_MODEL") or DEFAULT_MODEL
-        self.max_turns = max_turns
 
-    def run(self, toolbox: ToolBox, brief: str) -> str:
-        """Run the agentic loop; returns the model's final explanation text."""
-        messages: List[Dict[str, Any]] = [{"role": "user", "content": brief}]
-        text = ""
-        for _ in range(self.max_turns):
-            resp = self.client.messages.create(model=self.model, max_tokens=1024, system=SYSTEM_PROMPT,
-                                               tools=toolbox.schemas, messages=messages)
-            messages.append({"role": "assistant", "content": resp.content})
-            text = " ".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip() or text
-            if resp.stop_reason != "tool_use":
-                break
-            results = [{"type": "tool_result", "tool_use_id": b.id, "content": json.dumps(toolbox.call(b.name, b.input))}
-                       for b in resp.content if getattr(b, "type", "") == "tool_use"]
-            messages.append({"role": "user", "content": results})
-        return text
+    def decide(self, briefing: str) -> Dict[str, str]:
+        """Return {'option_id', 'diagnosis', 'explanation'}."""
+        resp = self.client.messages.create(
+            model=self.model, max_tokens=700, system=SYSTEM_PROMPT, tools=[SUBMIT_DECISION],
+            tool_choice={"type": "tool", "name": "submit_decision"},
+            messages=[{"role": "user", "content": tick_brief(briefing)}])
+        for block in resp.content:
+            if getattr(block, "type", "") == "tool_use" and block.name == "submit_decision":
+                return dict(block.input)
+        raise ValueError("model did not call submit_decision")
 
 
 # ---------------------------------------------------------------- agent
 class OrchestratorAgent:
-    """Runs one decision per tick against a :class:`Simulator`."""
+    """Runs one fully autonomous decision per tick against a :class:`Simulator`."""
 
-    def __init__(self, sim: Simulator, config: Config, use_llm: Optional[bool] = None, auto_approve: bool = True,
+    def __init__(self, sim: Simulator, config: Config, use_llm: Optional[bool] = None,
                  log_path: Optional[Path] = DEFAULT_LOG, llm_every_n: Optional[int] = None,
-                 llm: Optional[LLMReasoner] = None) -> None:
+                 llm: Optional[LLMReasoner] = None, persist_learning: bool = False,
+                 n_futures: Optional[int] = None, parallel: bool = True) -> None:
         self.sim, self.cfg = sim, config
-        self.forecaster = Forecaster(sim)
-        self.mock = MockReasoner(config)
-        self.auto_approve = auto_approve
-        self.log_path = Path(log_path) if log_path else None
+        self.parallel = parallel
         a = config.agent
         self.horizon = int(a.get("horizon", 16))
+        self.n_futures = int(n_futures or a.get("scenarios", 100))
         self.llm_every_n = int(llm_every_n or a.get("llm_every_n_ticks", 8))
-        self.export_threshold = float(a.get("export_approval_mw", 50))
-        self.permission_ticks = int(a.get("permission_ticks", 8))
         self.max_relax = int(a.get("max_relax_attempts", 2))
+        path = resolve_path(config.data.get("learning_file", "data/learning.json")) if persist_learning else None
+        self.learner = ForecastLearner(lead=4, rate=float(a.get("learning_rate", 0.15)), path=path)
+        self.forecaster = Forecaster(sim, learner=self.learner)
+        self.log_path = Path(log_path) if log_path else None
         self.llm: Optional[LLMReasoner] = llm
         self.llm_error = ""
         key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -137,93 +171,116 @@ class OrchestratorAgent:
                 self.llm = LLMReasoner(key)
             except Exception as exc:  # SDK missing/misconfigured → offline mode
                 self.llm_error = f"LLM unavailable: {exc}"
-        self.toolbox = ToolBox(self)
-        self.criteria, self.criteria_reason = self.mock.choose_criteria("normal")
-        self.situation = "normal"
-        self.last_llm_tick = -10 ** 6
-        self.last_llm_text = ""
-        self.last_alert_kinds: set = set()
-        self.plans: Dict[str, Plan] = {}
-        self.approvals: List[ApprovalRequest] = []
-        self.permissions: Dict[str, tuple] = {}        # kind -> (granted, until_tick)
+        self.ref_price = float(np.median(sim.profile.mcp)) + config.market.buy_adder
         self.decisions: List[Decision] = []
+        self.current_forecast: Optional[Forecast] = None
+        self.current_alerts: list = []
+        self.current_signals = Signals()
+        self._da_soc: Dict[int, float] = {}
+        self._da_renew: Dict[int, float] = {}
+        self._signature: Optional[tuple] = None
+        self._last_llm_tick = -10 ** 6
+        self._last_headline: List[str] = []
         self._inspected: set = set()
         self._notes: List[str] = []
-        self._outcome: Dict[str, Any] = {}
-        self.current_state: GridState = sim.state()
-        self.current_forecast: Forecast = self.forecaster.forecast(self.horizon)
-        self.current_alerts = sim.alerts(self.horizon)
 
     @property
     def mode(self) -> str:
-        return "llm" if self.llm else "mock"
+        return "llm" if self.llm else "offline"
 
     # ------------------------------------------------------------ main loop
     def step(self) -> Decision:
-        """Run one full perceive → … → explain cycle and advance the simulator one tick."""
-        sim = self.sim
-        self._notes, self._outcome = [], {}
-        self.toolbox.reset()
-        # Perceive
-        st = self.current_state = sim.state()
-        fc = self.current_forecast = self.forecaster.forecast(self.horizon)
-        alerts = self.current_alerts = sim.alerts(self.horizon)
-        # Assess (cheap detector — also decides whether the LLM is worth a call)
-        ref_price = float(np.median(sim.profile.mcp)) + self.cfg.market.buy_adder
-        expected = float(sim.profile.demand[st.tick % sim.T].sum())
-        assessment = self.mock.assess(st, fc, alerts, ref_price, expected)
-        kinds = {a.kind for a in alerts}
-        changed = assessment.situation != self.situation or not kinds <= self.last_alert_kinds
-        self.last_alert_kinds = kinds
-        reasoner, llm_error, explanation = "mock", "", ""
-
-        if self.llm and (changed or st.tick - self.last_llm_tick >= self.llm_every_n):
-            try:
-                explanation = self.llm.run(self.toolbox, tick_brief(st.tick, st.hour, assessment.situation,
-                                                                      assessment.signals))
-                self.last_llm_tick, self.last_llm_text = st.tick, explanation
-                reasoner = "llm"
-                if self.toolbox.criteria is not None:
-                    self.criteria = self.toolbox.criteria
-                    self.situation = self.toolbox.situation
-                    self.criteria_reason = self.toolbox.reasoning or "chosen by LLM"
-                else:
-                    self._set_mock_criteria(assessment.situation)
-                    llm_error = "LLM did not call run_optimizer; used rule-based criteria"
-            except Exception as exc:  # API outage, rate limit, bad response → offline reasoner
-                llm_error = f"{type(exc).__name__}: {exc}"[:300]
-                reasoner = "mock (llm error)"
-                self._set_mock_criteria(assessment.situation)
-        elif self.llm and assessment.situation == self.situation:
-            reasoner = "llm-cached"
+        """One full autonomous cycle; advances the simulator one tick."""
+        sim, cfg, H = self.sim, self.cfg, self.horizon
+        self._notes = []
+        self._operations()                                              # maintenance & crews (autonomous)
+        # PERCEIVE (+ LEARN from the forecast that targeted this tick)
+        st = sim.state()
+        raw = self.forecaster.raw(H)
+        fc = self.current_forecast = self.learner.correct(raw)
+        self.learner.observe(raw, fc, st)
+        alerts = self.current_alerts = sim.alerts(H)
+        signature = (len(sim.events), len(sim.outages), tuple(sorted({a.kind for a in alerts})))
+        trigger = "shock" if self._signature is not None and signature != self._signature else "scheduled"
+        self._signature = signature
+        if not self._da_soc or trigger == "shock":
+            self._day_ahead(st)
+        # DIAGNOSE
+        sig = self.current_signals = self._diagnose(st, fc, alerts)
+        headline = sig.headline()
+        # OPTIONS + STRESS-TEST
+        futures = sample_futures(st, fc, cfg, sig.storms, self.n_futures, seed=sim.seed * 7919 + st.tick)
+        target = self._da_soc.get(st.tick + H - 1)
+        crits = [self._tune(base, sig) for _, base in OPTION_GRID]
+        solve = lambda c: optimize(st, fc, cfg, c, soc_target_mwh=target)  # noqa: E731
+        if self.parallel:   # each CBC solve is a separate process → threads give real parallelism
+            with ThreadPoolExecutor(max_workers=min(len(crits), os.cpu_count() or 1)) as pool:
+                results = list(pool.map(solve, crits))
         else:
-            self._set_mock_criteria(assessment.situation)
-            reasoner = "mock" if not self.llm else "mock (situation changed)"
-
-        self._operations()
-        # Optimize + validate (unless the LLM already executed a plan)
-        if not self.toolbox.executed:
-            plan = self.get_plan(self.toolbox.plan_id) if self.toolbox.plan_id else None
-            plan = plan or self.make_plan(self.criteria)
-            self.execute(plan)
-        plan = self.plans[self._outcome["plan_id"]]
-        # Explain
-        if reasoner != "llm" or not explanation:
-            explanation = self.mock.explain(self.situation, assessment.signals, self.criteria, self._outcome)
-            if reasoner == "llm-cached" and self.last_llm_text:
-                explanation = f"(Criteria from LLM at tick {self.last_llm_tick}.) " + explanation
-        decision = Decision(
-            tick=st.tick, hour=st.hour, situation=self.situation, signals=assessment.signals, reasoner=reasoner,
-            criteria=self.criteria.to_dict(), criteria_reason=self.criteria_reason, plan_source=plan.source,
-            attempts=plan.attempts, validation=self._outcome["validation"], action=self._outcome["action"],
-            action_summary=self._outcome["first_tick"], approvals=self._outcome.get("approvals", []),
-            notes=self._notes, explanation=explanation, kpi=self._outcome["kpi"],
-            tool_calls=list(self.toolbox.calls), llm_error=llm_error or self.llm_error,
-        )
-        self.decisions.append(decision)
-        self._log(decision)
-        self.plans = {k: v for k, v in self.plans.items() if v.tick >= st.tick}   # drop stale plans
-        return decision
+            results = [solve(c) for c in crits]
+        options = []
+        for k, ((name, _), crit, res) in enumerate(zip(OPTION_GRID, crits, results)):
+            opt = Option(f"O{k + 1}", name, crit, res)
+            if res.status == "optimal":
+                opt.validation = validate(res.action, st, cfg)
+                if opt.validation.passed:
+                    opt.stress = stress_test(res.action, res.plan, st, fc, cfg, futures)
+                else:
+                    opt.reason = "fails physics check: " + "; ".join(opt.validation.violations)
+            else:
+                opt.reason = f"optimizer: {res.status}"
+            options.append(opt)
+        # CHOOSE (priority ladder)
+        chosen, eligible = self._ladder(options, sig)
+        reasoner, llm_error, diag, expl = "offline", "", diagnosis_text(headline), ""
+        if chosen is not None and self.llm and eligible and self._should_consult(trigger, headline, st.tick):
+            try:
+                pick = self.llm.decide(build_briefing(clock(st.tick), sig.to_dict(), [t for t, _ in headline],
+                                                      [o.row() for o in options], chosen.id,
+                                                      [o.id for o in eligible], cfg.targets))
+                self._last_llm_tick = st.tick
+                reasoner = "llm"
+                diag, expl = pick.get("diagnosis") or diag, pick.get("explanation", "")
+                by_id = {o.id: o for o in eligible}
+                if pick.get("option_id") in by_id:
+                    if pick["option_id"] != chosen.id:
+                        self._notes.append(f"LLM overrode ladder pick {chosen.id} → {pick['option_id']}")
+                    chosen = by_id[pick["option_id"]]
+                else:
+                    llm_error = f"LLM picked non-eligible '{pick.get('option_id')}', kept {chosen.id}"
+                    expl = ""
+            except Exception as exc:  # API outage etc. → ladder pick stands
+                llm_error = f"{type(exc).__name__}: {exc}"[:300]
+        # VERIFY → repair → fallback
+        action, source, crit = (chosen.action, "optimizer", chosen.criteria) if chosen else self._repair(st, fc, options)
+        vr = validate(action, st, cfg)
+        if not vr.passed and source != "fallback":
+            self._notes.append("final check failed → safe fallback")
+            action, source = safe_action(st, cfg), "fallback"
+            vr = validate(action, st, cfg)
+        if not vr.passed:
+            self._notes.append("EMERGENCY: supply physically short of critical load; fallback minimises it")
+        # ACT
+        self._flag_high_impact(action, st)
+        kpi = sim.step(action)
+        summary = describe_action(action)
+        rows = [o.row() for o in options]
+        chosen_row = next((r for r in rows if chosen and r["id"] == chosen.id), None)
+        if not expl:
+            expl = explain(chosen_row or {}, rows, self._tolerance(), _summarize(summary), self.n_futures,
+                           fallback=chosen_row is None, source=source)
+        d = Decision(
+            tick=st.tick, hour=st.hour, time=clock(st.tick), trigger=trigger, signals=sig.to_dict(),
+            headline=[list(h) for h in headline], diagnosis=diag, options=rows,
+            chosen=chosen.id if chosen else source, chosen_name=chosen.name if chosen else source,
+            criteria=crit.to_dict(), plan_source=source, reasoner=reasoner, validation=vr.to_dict(),
+            action=action.to_dict(), action_summary=summary, notes=self._notes, explanation=expl,
+            kpi=kpi.to_dict(), llm_error=llm_error or self.llm_error)
+        self.decisions.append(d)
+        self._log(d)
+        if sim.done:
+            self.learner.end_of_day()
+        return d
 
     def run_day(self) -> List[Decision]:
         """Step until the simulated day ends."""
@@ -231,197 +288,129 @@ class OrchestratorAgent:
             self.step()
         return self.decisions
 
-    def _set_mock_criteria(self, situation: str) -> None:
-        self.situation = situation
-        self.criteria, self.criteria_reason = self.mock.choose_criteria(situation)
+    # ------------------------------------------------------------ diagnose & choose
+    def _diagnose(self, st: GridState, fc: Forecast, alerts: list) -> Signals:
+        sim, cfg = self.sim, self.cfg
+        t = st.tick % sim.T
+        cap_s = np.array([f.capacity_mw for f in cfg.solar])
+        cap_w = np.array([f.capacity_mw for f in cfg.wind])
+        total = cap_s.sum() + cap_w.sum()
+        offline = ((cap_s * (1 - sim.solar_avail[t])).sum() + (cap_w * (1 - sim.wind_avail[t])).sum()) / total
+        k = sim.kpis
+        return diagnose(st, fc, alerts, cfg, self.ref_price, float(sim.profile.demand[t].sum()),
+                        self._da_renew.get(st.tick), float(offline), sum(x.co2_t for x in k),
+                        sum(x.cost_rs for x in k), sum(x.served_mwh for x in k), len(k))
 
-    # ------------------------------------------------------------ optimize / validate
-    def make_plan(self, criteria: Criteria) -> Plan:
-        """Optimize → validate; relax up to ``max_relax`` times; else safe fallback. Never raises."""
-        st, fc = self.current_state, self.current_forecast
-        base = self._apply_permissions(criteria.normalized())
-        attempts: List[Dict[str, Any]] = []
-        crit = base
-        for attempt in range(self.max_relax + 1):
+    def _tune(self, base: Criteria, sig: Signals) -> Criteria:
+        """Industry targets shift every option's weights continuously (more CO₂ pressure → greener)."""
+        clean = base.w_clean * float(np.clip(sig.carbon_pressure, 0.5, 3.0))
+        return Criteria(base.w_cost, clean, base.w_reliability, base.reserve_pct, base.uncertainty_mode).normalized()
+
+    def _tolerance(self) -> float:
+        return float(self.cfg.targets.get("max_shortfall_prob", 0.02))
+
+    def _ladder(self, options: List[Option], sig: Signals) -> Tuple[Optional[Option], List[Option]]:
+        """1 Safety > 2 Reliability (≤ tolerance) > 3 Cost vs Clean > 4 Battery life."""
+        m, tol = self.cfg.market, self._tolerance()
+        ra = float(self.cfg.targets.get("risk_aversion", 0.3))
+        clean_w = float(np.clip(sig.carbon_pressure, 0.5, 3.0))
+        tested = [o for o in options if o.stress is not None]
+        for o in tested:
+            s = o.stress
+            o.score = (s.cost_avg + ra * (s.cost_p95 - s.cost_avg)
+                       + clean_w * (s.co2_t * m.carbon_price + s.curtailed_mwh * m.curtailment_penalty))
+            o.status = "eligible" if s.p_shortfall <= tol + 1e-9 else "too risky"
+            if o.status == "too risky":
+                o.reason = f"shortfall risk {s.p_shortfall:.0%} > {tol:.0%}"
+        if not tested:
+            return None, []
+        eligible = [o for o in tested if o.status == "eligible"]
+        if not eligible:  # nothing meets the tolerance: minimise risk, then score
+            best = min(tested, key=lambda o: (round(o.stress.p_shortfall, 3), o.stress.unserved_critical_mwh, o.score))
+            self._notes.append(f"no plan meets the {tol:.0%} shortfall tolerance; chose the least risky")
+            return best, [best]
+        best_score = min(o.score for o in eligible)
+        near = [o for o in eligible if o.score <= best_score + max(300.0, 0.003 * abs(best_score))]
+        chosen = min(near, key=lambda o: (o.stress.battery_throughput_mwh, o.score))   # battery-life tiebreak
+        for o in eligible:
+            if o is not chosen:
+                o.reason = f"₹{o.score - chosen.score:,.0f} worse on cost/clean score" if o.score > chosen.score \
+                    else "similar score, more battery wear"
+        chosen.reason = "chosen"
+        return chosen, eligible
+
+    def _should_consult(self, trigger: str, headline: list, tick: int) -> bool:
+        texts = [t for t, _ in headline]
+        changed = texts != self._last_headline
+        self._last_headline = texts
+        return trigger == "shock" or changed or tick - self._last_llm_tick >= self.llm_every_n
+
+    def _repair(self, st: GridState, fc: Forecast, options: List[Option]) -> Tuple[Action, str, Criteria]:
+        """No option passed: relax constraints (shedding, then unserved) and retry; else safe fallback."""
+        base = OPTION_GRID[-2][1]
+        for attempt in range(1, self.max_relax + 1):
+            crit = base.relaxed(attempt)
             res = optimize(st, fc, self.cfg, crit)
-            rec = {"attempt": attempt, "status": res.status, "reserve_pct": round(crit.reserve_pct, 3),
-                   "allow_shedding": crit.allow_shedding, "allow_unserved": crit.allow_unserved,
-                   "solve_s": round(res.solve_time_s, 3)}
-            if res.status == "optimal":
-                vr = validate(res.action, st, self.cfg)
-                rec["validation"] = vr.violations or "passed"
-                attempts.append(rec)
-                if vr.passed:
-                    src = "optimizer" if attempt == 0 else f"optimizer (relaxed x{attempt})"
-                    return self._store(Plan("", st.tick, crit, res.action, src, vr, attempts, res.objective))
-            else:
-                rec["message"] = res.message
-                attempts.append(rec)
-            crit = self._apply_permissions(base.relaxed(attempt + 1))
-        action = safe_action(st, self.cfg, reserve_pct=min(base.reserve_pct, 0.2))
-        attempts.append({"attempt": "fallback", "status": "rule-based"})
-        return self._store(Plan("", st.tick, base, action, "fallback", validate(action, st, self.cfg), attempts))
+            if res.status == "optimal" and validate(res.action, st, self.cfg).passed:
+                self._notes.append(f"repaired by relaxing constraints (attempt {attempt})")
+                return res.action, f"optimizer (relaxed x{attempt})", crit
+        self._notes.append("repair failed → safe fallback controller")
+        return safe_action(st, self.cfg, reserve_pct=0.2), "fallback", base
 
-    def _store(self, plan: Plan) -> Plan:
-        plan.id = f"P{plan.tick}-{len(self.plans) + 1}"
-        self.plans[plan.id] = plan
-        return plan
+    # ------------------------------------------------------------ day-ahead backbone
+    def _day_ahead(self, st: GridState) -> None:
+        """24 h LP plan (to end of day) giving a target battery trajectory; re-based after shocks."""
+        H = self.sim.T - st.tick
+        if H <= self.horizon:
+            return
+        fc = self.forecaster.forecast(H)
+        if not self._da_renew:
+            self._da_renew = {st.tick + k: float(fc.solar["p50"][k].sum() + fc.wind["p50"][k].sum()) for k in range(H)}
+        res = optimize(st, fc, self.cfg, Criteria(0.45, 0.30, 0.25, 0.25, "p50"), time_limit_s=20,
+                       relax_binaries=True)
+        if res.status == "optimal":
+            self._da_soc = {st.tick + k: v for k, v in enumerate(res.plan["soc_mwh"])}
 
-    def get_plan(self, plan_id: str) -> Optional[Plan]:
-        return self.plans.get(plan_id)
-
-    def _apply_permissions(self, c: Criteria) -> Criteria:
-        """Respect recent operator rejections so the agent doesn't keep re-asking."""
-        granted, until = self.permissions.get("large_export", (True, -1))
-        if not granted and self.sim.tick <= until:
-            c = replace(c, max_export_mw=self.export_threshold)
-        return c
-
-    # ------------------------------------------------------------ act
-    def execute(self, plan: Plan) -> Dict[str, Any]:
-        """Approval gate → final validation → apply to the digital twin."""
-        st = self.current_state
-        action, source, approvals = plan.action.copy(), plan.source, []
-        for kind, reason in self._high_impact(action):
-            if self._permitted(kind):
-                continue
-            req = self.request_approval(kind, reason, describe_action(action))
-            approvals.append(req.id)
-            if req.status == "auto-approved":
-                continue
-            action, source = self._without(kind, action, plan)
-        vr = validate(action, st, self.cfg)
-        if not vr.passed and source != "fallback":
-            self._notes.append(f"final validation failed ({'; '.join(vr.violations)}) → fallback")
-            action, source = safe_action(st, self.cfg), "fallback"
-            vr = validate(action, st, self.cfg)
-        if not vr.passed:
-            self._notes.append("EMERGENCY: supply cannot cover critical load; fallback minimises unserved energy")
-        kpi = self.sim.step(action)
-        first = describe_action(action)
-        self._outcome = {"plan_id": plan.id, "source": source, "validation": vr.to_dict(), "action": action.to_dict(),
-                         "first_tick": first, "approvals": approvals, "kpi": kpi.to_dict(),
-                         "fallback": source == "fallback", "summary": summarize(first)}
-        if source != plan.source:
-            plan.source = source
-        return {"executed": True, "source": source, "validation": vr.to_dict(), "first_tick": first,
-                "approvals": approvals, "violations": kpi.violations}
-
-    def _high_impact(self, a: Action) -> List[tuple]:
-        out = []
-        if a.shed_mw.sum() > 1e-3:
-            out.append(("load_shedding", f"Plan sheds {a.shed_mw.sum():.1f} MW of flexible load"))
-        if a.grid_export_mw > self.export_threshold + 1e-6:
-            out.append(("large_export", f"Plan exports {a.grid_export_mw:.1f} MW (> {self.export_threshold:.0f} MW)"))
-        return out
-
-    def _without(self, kind: str, action: Action, plan: Plan) -> tuple:
-        """Re-plan without an unapproved high-impact action; emergency shedding if physically required."""
-        st = self.current_state
-        if kind == "large_export":
-            c = replace(plan.criteria, max_export_mw=self.export_threshold)
-        else:
-            c = replace(plan.criteria, allow_shedding=False, allow_unserved=False)
-        res = optimize(st, self.current_forecast, self.cfg, c)
-        if res.status == "optimal" and validate(res.action, st, self.cfg).passed:
-            self._notes.append(f"{kind} held pending approval; re-optimised without it")
-            return res.action, plan.source + " (approval-constrained)"
-        if kind == "large_export":
-            capped = cap_export(action, st, self.export_threshold)
-            self._notes.append("large export held pending approval; surplus curtailed instead")
-            return capped, plan.source + " (export capped)"
-        self._notes.append("EMERGENCY load shedding executed while approval pending: supply is physically short")
-        return action, plan.source
-
-    # ------------------------------------------------------------ approvals
-    def request_approval(self, kind: str, reason: str, details: Dict[str, Any]) -> ApprovalRequest:
-        """Queue (or auto-approve) a human approval request; duplicates of a pending kind are merged."""
-        for r in self.approvals:
-            if r.kind == kind and r.status == "pending" and kind != "delay_maintenance":
-                return r
-        req = ApprovalRequest(f"A{len(self.approvals) + 1}", self.sim.tick, kind, reason, jsonable(details))
-        self.approvals.append(req)
-        if self.auto_approve:
-            self._resolve(req, True, auto=True)
-        return req
-
-    def resolve_approval(self, req_id: str, approved: bool) -> ApprovalRequest:
-        """Operator decision from the UI."""
-        req = next(r for r in self.approvals if r.id == req_id)
-        if req.status == "pending":
-            self._resolve(req, approved)
-        return req
-
-    def _resolve(self, req: ApprovalRequest, approved: bool, auto: bool = False) -> None:
-        req.status = ("auto-approved" if auto else "approved") if approved else "rejected"
-        if req.kind in ("load_shedding", "large_export"):
-            self.permissions[req.kind] = (approved, self.sim.tick + self.permission_ticks)
-        if req.kind == "delay_maintenance":
-            m = next((m for m in self.sim.maintenance if m.id == req.details.get("request_id")), None)
-            if m and m.scheduled_start is None:
-                start = int(req.details["start"]) if approved else m.requested_start
-                self.sim.schedule_maintenance(m.id, max(start, self.sim.tick))
-
-    def _permitted(self, kind: str) -> bool:
-        granted, until = self.permissions.get(kind, (False, -1))
-        return bool(granted) and self.sim.tick <= until
-
-    def pending_approvals(self) -> List[ApprovalRequest]:
-        return [r for r in self.approvals if r.status == "pending"]
-
-    # ------------------------------------------------------------ operations
+    # ------------------------------------------------------------ autonomous operations
     def _operations(self) -> None:
-        """Deterministic housekeeping: schedule maintenance requests, send crews to faults."""
+        """Schedule maintenance into the lowest-impact slot and send crews to breakdowns — no approval."""
         sim = self.sim
-        pending_ids = {r.details.get("request_id") for r in self.pending_approvals()}
         for m in sim.maintenance:
-            if m.scheduled_start is None and m.id not in pending_ids:
-                self.schedule_maintenance(m.id, None)
-        for b, ok in enumerate(self.current_state.battery_available):
-            key = (self.cfg.batteries[b].id, next((e.start_tick for e in sim.events
-                                                  if e.kind == "battery_unavailable" and e.active(sim.tick)), -1))
-            if not ok and key not in self._inspected and sim.maintenance_active(key[0]) is False:
+            if m.scheduled_start is None and sim.tick >= m.requested_start - self.horizon:
+                start = self._best_window(m)
+                sim.schedule_maintenance(m.id, start)
+                moved = "" if start == m.requested_start else f" (moved from {clock(m.requested_start)})"
+                self._notes.append(f"Scheduled maintenance {m.id} on {m.asset_id} at {clock(start)}{moved}")
+        for o in sim.outages:
+            key = (o["asset"], o["start"])
+            if o["cause"] == "breakdown" and o["start"] <= sim.tick < o["end"] and key not in self._inspected:
                 self._inspected.add(key)
-                self._notes.append(sim.dispatch_inspection(key[0]))
+                self._notes.append(sim.dispatch_inspection(o["asset"]))
 
-    def schedule_maintenance(self, request_id: str, start_tick: Optional[int]) -> Dict[str, Any]:
-        """Choose (or accept) a start; delays beyond the requested start need approval."""
+    def _best_window(self, m: Any) -> int:
+        """Start inside the allowed window that minimises forecast lost energy × price."""
         sim = self.sim
-        m = next((x for x in sim.maintenance if x.id == request_id), None)
-        if m is None:
-            return {"error": f"unknown maintenance request {request_id}"}
-        if m.scheduled_start is not None:
-            return {"status": "already scheduled", "start_tick": m.scheduled_start}
-        lo, hi = max(sim.tick, m.requested_start - m.window // 2), m.requested_start + m.window
-        start = int(np.clip(start_tick, lo, hi)) if start_tick is not None else self._best_window(m, lo, hi)
-        if start > m.requested_start:
-            req = self.request_approval("delay_maintenance",
-                                        f"Move {m.id} on {m.asset_id} from tick {m.requested_start} to {start} "
-                                        f"(lower lost output)", {"request_id": m.id, "start": start})
-            if req.status == "pending":
-                return {"status": "pending approval", "approval_id": req.id, "proposed_start": start}
-            return {"status": "scheduled", "start_tick": m.scheduled_start, "approval_id": req.id}
-        sim.schedule_maintenance(m.id, start)
-        self._notes.append(f"maintenance {m.id} scheduled at tick {start}")
-        return {"status": "scheduled", "start_tick": start}
-
-    def _best_window(self, m: Any, lo: int, hi: int) -> int:
-        """Start that minimises forecast lost energy × price for the asset."""
-        fc = self.forecaster.forecast(hi - self.sim.tick + m.duration + 1)
-        kind, idx = self.sim.asset_index(m.asset_id)
+        lo, hi = max(sim.tick, m.requested_start - m.window), min(sim.T - m.duration, m.requested_start + m.window)
+        if hi <= lo:
+            return max(sim.tick, m.requested_start)
+        fc = self.forecaster.forecast(hi - sim.tick + m.duration + 1)
+        kind, idx = sim.asset_index(m.asset_id)
         price = fc.price["p50"]
-        out = {"solar": fc.solar["p50"][:, idx] if kind == "solar" else None,
-               "wind": fc.wind["p50"][:, idx] if kind == "wind" else None}.get(kind)
-        out = out if out is not None else np.full(len(price), 10.0)    # battery: lost arbitrage ∝ price
-        best, best_cost = m.requested_start, np.inf
+        out = {"solar": fc.solar["p50"], "wind": fc.wind["p50"]}.get(kind)
+        out = out[:, idx] if out is not None else np.full(len(price), 10.0)
+        best, best_cost = max(lo, m.requested_start), np.inf
         for s in range(lo, hi + 1):
-            k0 = s - self.sim.tick
-            if k0 < 0 or k0 + m.duration > len(price):
-                continue
+            k0 = s - sim.tick
             cost = float((out[k0:k0 + m.duration] * price[k0:k0 + m.duration]).sum())
             if cost < best_cost - 1e-6 or (abs(cost - best_cost) <= 1e-6 and s == m.requested_start):
                 best, best_cost = s, cost
         return best
+
+    def _flag_high_impact(self, a: Action, st: GridState) -> None:
+        if a.shed_mw.sum() > 1e-3:
+            self._notes.append(f"Autonomously shed {a.shed_mw.sum():.1f} MW of flexible load")
+        if a.grid_export_mw > 0.8 * st.export_limit_mw > 0:
+            self._notes.append(f"Large export {a.grid_export_mw:.1f} MW (near line limit)")
 
     # ------------------------------------------------------------ logging
     def _log(self, d: Decision) -> None:
@@ -443,27 +432,11 @@ def describe_action(a: Action) -> Dict[str, float]:
             "unserved_critical_mw": round(float(a.unserved_critical_mw.sum()), 2)}
 
 
-def summarize(d: Dict[str, float]) -> str:
-    """One clause describing the executed dispatch."""
+def _summarize(d: Dict[str, float]) -> str:
     parts = []
     for key, verb in (("battery_charge_mw", "charged batteries"), ("battery_discharge_mw", "discharged batteries"),
                       ("import_mw", "imported"), ("export_mw", "exported"), ("curtail_mw", "curtailed"),
-                      ("dr_mw", "called demand response for"), ("shed_mw", "shed")):
+                      ("dr_mw", "paid demand response for"), ("shed_mw", "shed")):
         if d.get(key, 0) > 0.05:
             parts.append(f"{verb} {d[key]:.1f} MW")
     return ", ".join(parts) or "held a balanced position with no grid trades"
-
-
-def cap_export(a: Action, st: GridState, limit: float) -> Action:
-    """Reduce export to ``limit`` by curtailing renewables pro-rata (keeps power balance)."""
-    out = a.copy()
-    excess = max(0.0, out.grid_export_mw - limit)
-    if excess <= 0:
-        return out
-    out.grid_export_mw = limit
-    room_s, room_w = st.solar_mw - out.curtail_solar_mw, st.wind_mw - out.curtail_wind_mw
-    total = float(room_s.sum() + room_w.sum())
-    if total > 0:
-        out.curtail_solar_mw = out.curtail_solar_mw + room_s * min(1.0, excess / total)
-        out.curtail_wind_mw = out.curtail_wind_mw + room_w * min(1.0, excess / total)
-    return out

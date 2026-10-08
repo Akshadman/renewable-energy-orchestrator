@@ -63,6 +63,13 @@ class Simulator:
         self.price_mult = np.ones(self.T)
         self.line_mult = np.ones(self.T)
         self.battery_avail = np.full((self.T, n_b), bool(use_batteries))
+        self.solar_avail = np.ones((self.T, n_s))       # 0..1 — breakdowns & maintenance
+        self.wind_avail = np.ones((self.T, n_w))
+        # Hidden (not forecastable) effects: e.g. whether a probabilistic storm actually hits.
+        self.hidden_solar = np.ones((self.T, n_s))
+        self.hidden_wind = np.ones((self.T, n_w))
+        self.hidden_line = np.ones(self.T)
+        self.outages: List[Dict[str, Any]] = []
         self.critical_mw = np.array([c.base_mw * c.critical_frac for c in config.consumers])
         self.soc = np.array([b.soc_init * b.energy_mwh for b in config.batteries])
         self.tick = 0
@@ -73,18 +80,31 @@ class Simulator:
         self.inspections: List[Dict[str, Any]] = []
         self.history: List[Dict[str, Any]] = []
         self.kpis: List[TickKPI] = []
+        self._apply_schedules()
 
     # ------------------------------------------------------------ profiles
     def _build_profile(self) -> DayProfile:
         cfg, w = self.cfg, self.weather
-        solar = np.column_stack([solar_mw(w.irradiance[:, i], f.capacity_mw, f.performance_ratio)
-                                 for i, f in enumerate(cfg.solar)])
-        wind = np.column_stack([wind_mw(w.wind_speed[:, j], f.capacity_mw, f.cut_in_ms, f.rated_ms, f.cut_out_ms)
-                                for j, f in enumerate(cfg.wind)])
+        T = self.T
+        solar = _stack([solar_mw(w.irradiance[:, i], f.capacity_mw, f.performance_ratio)
+                        for i, f in enumerate(cfg.solar)], T)
+        wind = _stack([wind_mw(w.wind_speed[:, j], f.capacity_mw, f.cut_in_ms, f.rated_ms, f.cut_out_ms)
+                       for j, f in enumerate(cfg.wind)], T)
         rng = np.random.default_rng(self.seed + 7)
-        hours = np.arange(self.T) * 24.0 / self.T
-        demand = np.column_stack([c.base_mw * _load_shape(c.profile, hours) * (1 + _noise(rng, self.T, 0.02))
-                                  for c in cfg.consumers])
+        hours = np.arange(T) * 24.0 / T
+        cols = []
+        for c in cfg.consumers:
+            noise = 1 + _noise(rng, T, 0.02)
+            custom = cfg.custom_profiles.get(c.id)
+            if custom is not None and len(custom) > 0:     # uploaded utility consumption data
+                series = np.interp(np.linspace(0, len(custom) - 1, T), np.arange(len(custom)), custom)
+                cols.append(np.asarray(series, dtype=float) * noise)
+            else:
+                cols.append(c.base_mw * _load_shape(c.profile, hours) * noise)
+        demand = _stack(cols, T)
+        for win in cfg.schedules.get("conservation", []):  # industry's planned demand reduction
+            a, b = tick_of(win["start"], T), tick_of(win["end"], T)
+            demand[a:b] *= 1 - float(win.get("reduction_pct", 0)) / 100
         if w.source == "synthetic":
             mcp, src = self._synthetic_price(demand.sum(1) - solar.sum(1) - wind.sum(1), rng), "synthetic"
         else:
@@ -106,11 +126,16 @@ class Simulator:
     def _i(self, t: int) -> int:
         return t % self.T
 
-    def solar_at(self, t: int) -> np.ndarray:
-        return self.profile.solar[self._i(t)] * self.solar_mult[self._i(t)]
+    def solar_at(self, t: int, forecast: bool = False) -> np.ndarray:
+        """Solar MW available at ``t``. ``forecast=True`` hides effects that cannot be foreseen."""
+        i = self._i(t)
+        out = self.profile.solar[i] * self.solar_mult[i] * self.solar_avail[i]
+        return out if forecast else out * self.hidden_solar[i]
 
-    def wind_at(self, t: int) -> np.ndarray:
-        return self.profile.wind[self._i(t)] * self.wind_mult[self._i(t)]
+    def wind_at(self, t: int, forecast: bool = False) -> np.ndarray:
+        i = self._i(t)
+        out = self.profile.wind[i] * self.wind_mult[i] * self.wind_avail[i]
+        return out if forecast else out * self.hidden_wind[i]
 
     def demand_at(self, t: int) -> np.ndarray:
         return self.profile.demand[self._i(t)] * self.demand_mult[self._i(t)]
@@ -124,11 +149,13 @@ class Simulator:
         mcp = self.mcp_at(t)
         return mcp + m.buy_adder, mcp * m.sell_factor
 
-    def import_limit_at(self, t: int) -> float:
-        return self.cfg.grid.import_limit_mw * float(self.line_mult[self._i(t)])
+    def import_limit_at(self, t: int, forecast: bool = False) -> float:
+        i = self._i(t)
+        return self.cfg.grid.import_limit_mw * float(self.line_mult[i] * (1.0 if forecast else self.hidden_line[i]))
 
-    def export_limit_at(self, t: int) -> float:
-        return self.cfg.grid.export_limit_mw * float(self.line_mult[self._i(t)])
+    def export_limit_at(self, t: int, forecast: bool = False) -> float:
+        i = self._i(t)
+        return self.cfg.grid.export_limit_mw * float(self.line_mult[i] * (1.0 if forecast else self.hidden_line[i]))
 
     def battery_available_at(self, t: int) -> np.ndarray:
         return self.battery_avail[self._i(t)].copy()
@@ -157,14 +184,19 @@ class Simulator:
     def alerts(self, horizon: int = 16) -> List[Alert]:
         """Active/upcoming alerts from events, weather data and pending maintenance."""
         t = self.tick
-        out = [a for a in self.event_alerts if a.tick <= t < a.tick + max(a.eta_ticks, 0) + 8]
+        out = [a for a in self.event_alerts if a.tick <= t < a.tick + a.eta_ticks + max(a.duration_ticks, 1)]
+        out = [_aged(a, t) for a in out]
         out += weather_alerts(self.weather, self.cfg, min(t, self.T - 1), horizon)
         for m in self.maintenance:
             if m.scheduled_start is None:
                 out.append(Alert("maintenance_request", t,
-                                 f"Maintenance {m.id} on {m.asset_id} requested at tick {m.requested_start} "
-                                 f"for {m.duration} ticks (movable within {m.window} ticks)",
-                                 "info", max(0, m.requested_start - t)))
+                                 f"Maintenance {m.id} on {m.asset_id} requested for {clock(m.requested_start)} "
+                                 f"({m.duration * 15} min, movable ±{m.window * 15} min)",
+                                 "info", max(0, m.requested_start - t), 1.0, m.duration))
+        for o in self.outages:
+            if o["start"] <= t < o["end"]:
+                out.append(Alert("asset_outage", t, f"{o['asset']} {o['cause']} until {clock(o['end'])}",
+                                 "critical" if o["cause"] == "breakdown" else "warning", 0, 1.0, o["end"] - t))
         return out
 
     # ------------------------------------------------------------ events & ops
@@ -177,29 +209,56 @@ class Simulator:
         """Commit a maintenance job: asset output/availability is zero for its duration."""
         req = next(m for m in self.maintenance if m.id == req_id)
         req.scheduled_start = int(start)
-        sl = slice(max(0, start), min(self.T, start + req.duration))
-        kind, idx = self.asset_index(req.asset_id)
-        if kind == "solar":
-            self.solar_mult[sl, idx] = 0.0
-        elif kind == "wind":
-            self.wind_mult[sl, idx] = 0.0
-        elif kind == "battery":
-            self.battery_avail[sl, idx] = False
+        self.add_outage(req.asset_id, int(start), req.duration, "maintenance")
         return req
+
+    def add_outage(self, asset_id: str, start: int, duration: int, cause: str = "breakdown",
+                   severity: float = 1.0) -> Dict[str, Any]:
+        """Take (part of) an asset offline: ``severity`` 1.0 = fully unavailable."""
+        kind, idx = self.asset_index(asset_id)
+        sl = slice(max(0, start), min(self.T, start + duration))
+        if kind == "solar":
+            self.solar_avail[sl, idx] *= 1 - severity
+        elif kind == "wind":
+            self.wind_avail[sl, idx] *= 1 - severity
+        else:
+            self.battery_avail[sl, idx] = False
+        o = {"asset": asset_id, "kind": kind, "idx": idx, "start": sl.start, "end": sl.stop, "cause": cause,
+             "severity": severity}
+        self.outages.append(o)
+        return o
+
+    def _apply_schedules(self) -> None:
+        """Industry-provided maintenance (movable) and known breakdowns (fixed)."""
+        ids = {a.id for a in (*self.cfg.solar, *self.cfg.wind, *self.cfg.batteries)}
+        for job in self.cfg.schedules.get("maintenance", []):
+            if job.get("asset") not in ids:
+                continue
+            start, dur = tick_of(job["start"], self.T), max(1, int(round(float(job.get("hours", 1)) * 4)))
+            if job.get("kind", "maintenance") == "breakdown":
+                self.add_outage(job["asset"], start, dur, "breakdown", float(job.get("severity", 1.0)))
+            else:
+                self.maintenance.append(MaintenanceRequest(
+                    f"M{len(self.maintenance) + 1}", job["asset"], start, dur,
+                    max(0, int(round(float(job.get("flexible_hours", 0)) * 4)))))
 
     def dispatch_inspection(self, asset_id: str) -> str:
         """Send a crew: an unavailable battery returns to service after 4 ticks."""
         kind, idx = self.asset_index(asset_id)
         self.inspections.append({"tick": self.tick, "asset": asset_id})
-        future = self.battery_avail[self.tick:, idx] if kind == "battery" else np.array([True])
-        if not future.all():
-            start = self.tick + int(np.argmin(future))                 # first offline tick
-            rest = self.battery_avail[start:, idx]
-            end = start + (int(np.argmax(rest)) if rest.any() else len(rest))
-            back = min(end, max(start, self.tick + 4))
-            self.battery_avail[back:end, idx] = True
-            return f"Crew dispatched to {asset_id}; expected back in service at tick {back} (was {end})."
-        return f"Crew dispatched to {asset_id}; no fault found in schedule."
+        for o in self.outages:
+            if o["asset"] == asset_id and o["cause"] == "breakdown" and o["start"] <= self.tick < o["end"]:
+                back = min(o["end"], self.tick + 4)
+                sl = slice(back, o["end"])
+                if kind == "solar":
+                    self.solar_avail[sl, idx] = 1.0
+                elif kind == "wind":
+                    self.wind_avail[sl, idx] = 1.0
+                else:
+                    self.battery_avail[sl, idx] = True
+                was, o["end"] = o["end"], back
+                return f"Crew dispatched to {asset_id}: repair expected by {clock(back)} (was {clock(was)})."
+        return f"Crew dispatched to {asset_id}; no active breakdown found."
 
     def maintenance_active(self, asset_id: str) -> bool:
         """True if scheduled maintenance covers the current tick for ``asset_id``."""
@@ -380,6 +439,31 @@ class Simulator:
             "export_mwh": sum(x.export_mwh for x in k),
             "served_mwh": served,
         }
+
+
+def _aged(a: Alert, t: int) -> Alert:
+    """Alert as seen at tick ``t`` (eta counts down)."""
+    from dataclasses import replace
+    return replace(a, eta_ticks=max(0, a.tick + a.eta_ticks - t),
+                   duration_ticks=max(1, a.tick + a.eta_ticks + a.duration_ticks - max(t, a.tick + a.eta_ticks)))
+
+
+def tick_of(hhmm: Any, T: int = 96) -> int:
+    """'14:30' → tick index (also accepts an int tick)."""
+    if isinstance(hhmm, (int, np.integer)):
+        return int(np.clip(hhmm, 0, T))
+    h, m = str(hhmm).strip().split(":")[:2]
+    return int(np.clip(round((int(h) * 60 + int(m)) / (1440 / T)), 0, T))
+
+
+def clock(tick: int, T: int = 96) -> str:
+    """Tick index → 'HH:MM'."""
+    minutes = int(tick) % T * 1440 // T
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def _stack(cols: List[np.ndarray], T: int) -> np.ndarray:
+    return np.column_stack(cols) if cols else np.zeros((T, 0))
 
 
 def _shift(a: Action, b: int, delta: float) -> None:
