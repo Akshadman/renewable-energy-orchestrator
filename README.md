@@ -42,7 +42,7 @@ flowchart LR
     end
     IN --> PER[PERCEIVE<br/>state + learned P10/P50/P90<br/>forecasts + alerts with probabilities]
     PER --> DIA[DIAGNOSE<br/>9 continuous signals,<br/>all measured together]
-    DIA --> OPT[OPTIONS<br/>search inside 5 recipe bands:<br/>explore 15 → refine 6 combinations]
+    DIA --> OPT[OPTIONS<br/>search inside 9 recipe bands:<br/>explore 27 → refine 6 combinations]
     OPT --> ST[STRESS-TEST<br/>each plan × 100 futures<br/>avg ₹ · worst ₹ · P shortfall]
     ST --> CH[CHOOSE<br/>priority ladder<br/>± Claude among eligible]
     CH --> VER{VERIFY<br/>physics validator}
@@ -61,15 +61,19 @@ flowchart LR
 
    | Recipe | Battery reserve | Price sensitivity | Clean weight | Reliability weight | Forecast caution | Demand-response use |
    |---|---|---|---|---|---|---|
-   | Max savings | 5–30% | 55–80% | 10–30% | 5–20% | 0–30% | 100% |
-   | Green-lean | 15–45% | 20–40% | 45–70% | 10–25% | 0–40% | 100% |
-   | Balanced | 20–50% | 35–55% | 20–40% | 20–35% | 20–60% | 100% |
-   | Protective | 45–75% | 20–40% | 10–25% | 40–65% | 50–90% | 100% |
-   | Fortress | 70–90% | 10–25% | 5–15% | 60–85% | 80–100% | 100% |
+   | Max savings | 5–15% | 58–72% | 15–25% | 8–22% | 0–15% | 100% |
+   | Lean | 12–25% | 52–66% | 14–24% | 15–29% | 0–25% | 100% |
+   | Balanced | 22–35% | 46–60% | 13–23% | 23–37% | 10–35% | 100% |
+   | Green-lean | 20–40% | 23–37% | 48–62% | 10–20% | 0–25% | 100% |
+   | Steady | 32–45% | 39–53% | 11–21% | 31–45% | 20–50% | 100% |
+   | Cautious | 42–55% | 32–46% | 10–20% | 39–53% | 35–65% | 100% |
+   | Protective | 52–68% | 25–39% | 8–18% | 48–62% | 50–80% | 100% |
+   | Strong reserve | 64–80% | 17–31% | 7–17% | 58–72% | 65–95% | 100% |
+   | Fortress | 76–90% | 9–23% | 5–15% | 66–80% | 80–100% | 100% |
 
    *Demand-response use* is kept at 100% by default: an A/B test showed that letting the AI restrict it raised cost by ₹2.6 L/day. It stays editable as a contractual cap.
 
-   Every decision, the AI **explores** 3 combinations per band (15 total), then **refines** with 6 more around the best one. Each combination becomes an exact MW plan via the MILP optimizer, aimed at the **day-ahead plan's** battery trajectory (re-solved after every shock). *Forecast caution* blends smoothly from expected (P50) to pessimistic (P10 renewables / P90 demand). Bands are editable per industry in the Setup tab or `config/assets.yaml`.
+   The 9 recipes are the same ones as before (Max savings … Fortress), each now a range centred on its old setting and slightly overlapping its neighbours. Every decision, the AI **explores** 3 combinations per band (27 total), then **refines** with 6 more around the best one (33 combinations, under a second). Each combination becomes an exact MW plan via the MILP optimizer, aimed at the **day-ahead plan's** battery trajectory (re-solved after every shock). *Forecast caution* blends smoothly from expected (P50) to pessimistic (P10 renewables / P90 demand). Bands are editable per industry in the Setup tab or `config/assets.yaml`.
 4. **Stress-test:** each combination is replayed in 100 sampled futures. Futures are drawn from the forecast uncertainty and from each alert's probability, so a 35% storm hits in about 35 of them. The result is average cost, worst-case (P95) cost, the **probability of cutting critical load**, CO₂, curtailment and battery wear.
 5. **Choose, using a priority ladder with thresholds:**
    1. *Safety:* the plan must pass the physics validator.
@@ -78,7 +82,7 @@ flowchart LR
    4. *Battery life:* among near-equal plans, pick the one with the least wear.
 
    With an API key, Claude sees the whole briefing and may pick a different **eligible** plan, with its reasoning. Anything else is rejected by code.
-6. **Verify → act → explain:** validate again; if nothing is valid, repair (allow controlled flexible-load reduction), then fall back to the safe controller. Then execute and write a 2–3 sentence explanation, e.g. *"I tested 21 combinations from 5 recipe bands across 100 futures and chose a 'Protective' plan (≥67% reserve)… 'Max savings' would save ₹84,597 but risks a critical shortfall in 54% of futures (limit 2%)."*
+6. **Verify → act → explain:** validate again; if nothing is valid, repair (allow controlled flexible-load reduction), then fall back to the safe controller. Then execute and write a 2–3 sentence explanation, e.g. *"I tested 33 combinations from 9 recipe bands across 100 futures and chose a 'Protective' plan (≥67% reserve)… 'Max savings' would save ₹84,597 but risks a critical shortfall in 54% of futures (limit 2%)."*
 7. **Learn:** compare every 1-hour-ahead forecast with what happened, learn each resource's bias and how wide the P10–P90 band should be, apply that immediately, and save it to `data/learning.json` for the next day.
 
 **Operations, also autonomous:** maintenance jobs that may move are shifted into the slot that loses the least energy × price. Breakdowns get an inspection crew immediately, which shortens the outage.
@@ -89,8 +93,8 @@ The chosen protection depends on *how likely* a risk is, through the stress test
 
 | Storm probability | 0% | 10% | 50% | 90% |
 |---|---|---|---|---|
-| Battery reserve chosen | 17% | 41% | 49% | 57% |
-| Forecast caution | 15% | 34% | 89% | 89% |
+| Chosen recipe | Balanced | Steady | Protective | Protective |
+| Battery reserve chosen | 27% | 43% | 52% | 60% |
 
 Because the AI searches *inside* the recipe bands, protection rises smoothly with the risk instead of jumping between a few fixed plans.
 
@@ -133,6 +137,8 @@ Profiles can be saved and loaded (`config/profiles/*.yaml`). The default is a Ra
 100 randomized synthetic days, 3 unannounced shocks per day (storms with random probabilities, breakdowns,
 price spikes, congestion, …), offline mode. All controllers see identical weather, demand, prices and shocks.
 Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
+
+> ℹ️ Numbers below are from the 5-recipe-band run; a refresh for the 9-recipe version is in progress.
 
 | Mean per day | **AI** | Business-as-usual | No battery |
 |---|---:|---:|---:|
@@ -183,4 +189,4 @@ Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
 - Single-bus model; frequency is a proportional proxy of imbalance.
 - Demand comes from shapes or your uploaded data; prices are a labelled sample until a real IEX file is added.
 - Forecasts are simulated (future truth + bias + noise), not a trained weather model; learning corrects bias and calibration only.
-- The band search samples 21 combinations per decision. It finds very good combinations, but not a mathematically proven optimum (that would need full stochastic optimisation).
+- The band search samples 33 combinations per decision. It finds very good combinations, but not a mathematically proven optimum (that would need full stochastic optimisation).

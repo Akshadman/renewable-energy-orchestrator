@@ -59,11 +59,15 @@ agent:
   refine_candidates: 6         # extra combinations around the best one found
   recipes:                     # each parameter is a [min, max] band the AI searches inside (fractions)
                                # max_dr_frac = cap on demand response; restricting it raised cost in A/B tests
-    - {name: Max savings, reserve_pct: [0.05, 0.30], w_cost: [0.55, 0.80], w_clean: [0.10, 0.30], w_reliability: [0.05, 0.20], caution: [0.0, 0.3], max_dr_frac: [1.0, 1.0]}
-    - {name: Green-lean,  reserve_pct: [0.15, 0.45], w_cost: [0.20, 0.40], w_clean: [0.45, 0.70], w_reliability: [0.10, 0.25], caution: [0.0, 0.4], max_dr_frac: [1.0, 1.0]}
-    - {name: Balanced,    reserve_pct: [0.20, 0.50], w_cost: [0.35, 0.55], w_clean: [0.20, 0.40], w_reliability: [0.20, 0.35], caution: [0.2, 0.6], max_dr_frac: [1.0, 1.0]}
-    - {name: Protective,  reserve_pct: [0.45, 0.75], w_cost: [0.20, 0.40], w_clean: [0.10, 0.25], w_reliability: [0.40, 0.65], caution: [0.5, 0.9], max_dr_frac: [1.0, 1.0]}
-    - {name: Fortress,    reserve_pct: [0.70, 0.90], w_cost: [0.10, 0.25], w_clean: [0.05, 0.15], w_reliability: [0.60, 0.85], caution: [0.8, 1.0], max_dr_frac: [1.0, 1.0]}
+    - {name: Max savings, reserve_pct: [0.05, 0.15], w_cost: [0.58, 0.72], w_clean: [0.15, 0.25], w_reliability: [0.08, 0.22], caution: [0.0, 0.15], max_dr_frac: [1.0, 1.0]}
+    - {name: Lean, reserve_pct: [0.12, 0.25], w_cost: [0.52, 0.66], w_clean: [0.14, 0.24], w_reliability: [0.15, 0.29], caution: [0.0, 0.25], max_dr_frac: [1.0, 1.0]}
+    - {name: Balanced, reserve_pct: [0.22, 0.35], w_cost: [0.46, 0.6], w_clean: [0.13, 0.23], w_reliability: [0.23, 0.37], caution: [0.1, 0.35], max_dr_frac: [1.0, 1.0]}
+    - {name: Green-lean, reserve_pct: [0.2, 0.4], w_cost: [0.23, 0.37], w_clean: [0.48, 0.62], w_reliability: [0.1, 0.2], caution: [0.0, 0.25], max_dr_frac: [1.0, 1.0]}
+    - {name: Steady, reserve_pct: [0.32, 0.45], w_cost: [0.39, 0.53], w_clean: [0.11, 0.21], w_reliability: [0.31, 0.45], caution: [0.2, 0.5], max_dr_frac: [1.0, 1.0]}
+    - {name: Cautious, reserve_pct: [0.42, 0.55], w_cost: [0.32, 0.46], w_clean: [0.1, 0.2], w_reliability: [0.39, 0.53], caution: [0.35, 0.65], max_dr_frac: [1.0, 1.0]}
+    - {name: Protective, reserve_pct: [0.52, 0.68], w_cost: [0.25, 0.39], w_clean: [0.08, 0.18], w_reliability: [0.48, 0.62], caution: [0.5, 0.8], max_dr_frac: [1.0, 1.0]}
+    - {name: Strong reserve, reserve_pct: [0.64, 0.8], w_cost: [0.17, 0.31], w_clean: [0.07, 0.17], w_reliability: [0.58, 0.72], caution: [0.65, 0.95], max_dr_frac: [1.0, 1.0]}
+    - {name: Fortress, reserve_pct: [0.76, 0.9], w_cost: [0.09, 0.23], w_clean: [0.05, 0.15], w_reliability: [0.66, 0.8], caution: [0.8, 1.0], max_dr_frac: [1.0, 1.0]}
   learning_rate: 0.15          # EMA step for forecast-bias learning
 
 data:
