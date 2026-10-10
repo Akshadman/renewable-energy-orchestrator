@@ -89,5 +89,3 @@ targets:                       # industry goals
 schedules:
   maintenance:                 # planned work; the agent may move "flexible" jobs inside their window
     - {asset: W3, start: "14:00", hours: 2, kind: maintenance, flexible_hours: 4}
-  conservation:                # planned demand reduction by the industry
-    - {start: "18:30", end: "20:00", reduction_pct: 5}

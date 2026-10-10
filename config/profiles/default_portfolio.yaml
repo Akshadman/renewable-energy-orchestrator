@@ -172,8 +172,4 @@ schedules:
     hours: 2
     kind: maintenance
     flexible_hours: 5
-  conservation:
-  - start: '18:30'
-    end: '20:00'
-    reduction_pct: 5
 custom_profiles: {}

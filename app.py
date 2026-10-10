@@ -7,6 +7,7 @@ import time
 from datetime import date as Date
 from typing import Any, Dict, List
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -17,7 +18,6 @@ try:
 except ImportError:  # optional dependency
     pass
 
-from agent.recipes import PARAM_LABELS, PARAMS, load_recipes, recipes_to_rows, rows_to_recipes
 from agent.runner import Operation
 from core.config import config_from_dict, config_to_dict, list_profiles, load_config, save_profile, validate_config
 from core.data_sources import SOURCE_LABELS, SOURCES, load_weather_day, today_ist
@@ -184,15 +184,7 @@ def setup_tab() -> None:
                            "flexible_hours": st.column_config.NumberColumn("Can move ± hours", min_value=0),
                            "severity": st.column_config.NumberColumn("Capacity lost (0–1)", min_value=0, max_value=1)})
 
-        st.subheader("5 · Energy conservation schedule")
-        cons = st.data_editor(pd.DataFrame(raw["schedules"].get("conservation") or [],
-                                           columns=["start", "end", "reduction_pct"]),
-                              num_rows="dynamic", key="ed_cons", width="stretch",
-                              column_config={"start": "From (HH:MM)", "end": "To (HH:MM)",
-                                             "reduction_pct": st.column_config.NumberColumn("Reduce demand %",
-                                                                                            min_value=0, max_value=100)})
-
-        st.subheader("6 · Targets")
+        st.subheader("5 · Targets")
         t = raw.get("targets", {})
         tc = st.columns(4)
         carbon = tc[0].number_input("Annual CO₂ target (t)", 0.0, 1e8, float(t.get("annual_carbon_target_t", 250000)),
@@ -205,24 +197,12 @@ def setup_tab() -> None:
         aversion = tc[3].slider("Worst-case aversion", 0.0, 1.0, float(t.get("risk_aversion", 0.3)), 0.05,
                                 help="0 = only average cost matters · 1 = worst case matters as much")
 
-        st.subheader("7 · Plan recipes (ranges the AI searches inside)")
-        st.caption("Each recipe is a band: the AI tries many combinations inside these ranges every 15 minutes "
-                   "and picks the best one. Values in %. Weights are re-balanced to sum to 100%.")
-        cols_cfg = {"name": "Recipe"}
-        for prm in PARAMS:
-            short = PARAM_LABELS[prm]
-            cols_cfg[f"{prm}_min"] = st.column_config.NumberColumn(f"{short} min", min_value=0, max_value=100)
-            cols_cfg[f"{prm}_max"] = st.column_config.NumberColumn(f"{short} max", min_value=0, max_value=100)
-        recipes_df = st.data_editor(pd.DataFrame(recipes_to_rows(load_recipes(config_from_dict(raw)))),
-                                    num_rows="dynamic", key="ed_recipes", width="stretch", column_config=cols_cfg)
-
         b1, b2 = st.columns(2)
         apply = b1.form_submit_button("✅ Apply & start day", type="primary", width="stretch")
         save = b2.form_submit_button("💾 Save as profile", width="stretch")
 
     if apply or save:
-        new = _build_raw(raw, name, loads, solar, wind, bats, imp, exp, maint, cons, carbon, cost, risk, aversion)
-        new["agent"] = {**new.get("agent", {}), "recipes": rows_to_recipes(recipes_df.to_dict("records"))}
+        new = _build_raw(raw, name, loads, solar, wind, bats, imp, exp, maint, carbon, cost, risk, aversion)
         errors = validate_config(config_from_dict(new))
         if errors:
             for e in errors:
@@ -238,7 +218,7 @@ def setup_tab() -> None:
 
 
 def _clear_editors() -> None:
-    for k in ("ed_loads", "ed_solar", "ed_wind", "ed_bat", "ed_maint", "ed_cons", "ed_recipes"):
+    for k in ("ed_loads", "ed_solar", "ed_wind", "ed_bat", "ed_maint"):
         ss().pop(k, None)
 
 
@@ -256,7 +236,7 @@ def _records(df: pd.DataFrame, prefix: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _build_raw(raw, name, loads, solar, wind, bats, imp, exp, maint, cons, carbon, cost, risk, aversion) -> Dict:
+def _build_raw(raw, name, loads, solar, wind, bats, imp, exp, maint, carbon, cost, risk, aversion) -> Dict:
     """Turn the edited tables back into a configuration dict."""
     new = copy.deepcopy(raw)
     new["name"] = name or "My site"
@@ -274,8 +254,7 @@ def _build_raw(raw, name, loads, solar, wind, bats, imp, exp, maint, cons, carbo
         if c["id"] in new["custom_profiles"]:
             c["profile"] = "custom"
     new["grid"] = {**raw["grid"], "import_limit_mw": imp, "export_limit_mw": exp}
-    new["schedules"] = {"maintenance": [_clean(r) for r in maint.dropna(subset=["asset", "start"]).to_dict("records")],
-                        "conservation": [_clean(r) for r in cons.dropna(subset=["start", "end"]).to_dict("records")]}
+    new["schedules"] = {"maintenance": [_clean(r) for r in maint.dropna(subset=["asset", "start"]).to_dict("records")]}
     new["targets"] = {"annual_carbon_target_t": carbon, "target_cost_rs_per_mwh": cost,
                       "max_shortfall_prob": risk / 100, "risk_aversion": aversion}
     return new
@@ -515,6 +494,8 @@ def results_tab() -> None:
     else:
         st.caption("Run the day to see the comparison.")
 
+    best_recipe_section(op)
+
     st.subheader("🧪 What the AI has learned")
     learner = op.agent.learner
     st.caption("The AI compares every forecast with what actually happened and corrects itself; lessons are "
@@ -556,6 +537,140 @@ def results_tab() -> None:
     fig.update_layout(height=380, showlegend=False, margin=dict(l=10, r=10, t=30, b=10),
                       title=f"{METRICS[metric]} per day over {df.seed.nunique()} days")
     st.plotly_chart(fig, key="mc")
+
+
+def _blocks(ticks: List[int]) -> str:
+    """[40, 41, 42, 60] → '10:00–10:45, 15:00–15:15'."""
+    out, start, prev = [], None, None
+    for t in sorted(ticks):
+        if start is None:
+            start = prev = t
+        elif t == prev + 1:
+            prev = t
+        else:
+            out.append((start, prev))
+            start = prev = t
+    if start is not None:
+        out.append((start, prev))
+    return ", ".join(f"{clock(a)}–{clock(b + 1)}" for a, b in out[:8]) + (" …" if len(out) > 8 else "")
+
+
+TAG_KINDS = [("Storm", "Storm risk"), ("Price", "High price"), ("Cheap", "Cheap power"), ("Grid line", "Grid line limited"),
+             ("Batteries", "Battery out of service"), ("generation offline", "Generation offline"),
+             ("Demand", "Demand surprise"), ("Renewables", "Renewable shortfall"), ("CO₂", "CO₂ over budget pace")]
+
+
+def _tag_kind(text: str) -> str:
+    return next((label for key, label in TAG_KINDS if key in text), text)
+
+
+def best_recipe_section(op: Operation) -> None:
+    """Which recipe the AI relied on most today, and a step-by-step 'why' for its choices."""
+    st.subheader("🏆 Best recipe today — and why the AI chose it")
+    ds = op.agent.decisions
+    if not ds:
+        st.caption("Run the day to see which recipe the AI chose and why.")
+        return
+    order = [r.name for r in op.agent.recipes]
+    recs = []
+    for d in ds:
+        ch = next((o for o in d.options if o["id"] == d.chosen), None)
+        elig = sorted([o for o in d.options if o["status"] == "eligible" and o["id"] != d.chosen
+                       and o["score"] is not None], key=lambda o: o["score"])
+        rival = next((o for o in elig if o["name"] != d.chosen_name), None)     # best *other* recipe
+        risky = [o for o in d.options if o["status"] == "too risky"]
+        recs.append({"tick": d.tick, "recipe": d.chosen_name if ch else "Emergency / repair", "ch": ch,
+                     "rival": rival, "risky": risky, "tags": [t for t, lvl in d.headline if lvl != "ok"],
+                     "explanation": d.explanation, "time": d.time, "n": len(d.options)})
+    df = pd.DataFrame([{"recipe": r["recipe"], "tick": r["tick"]} for r in recs])
+    counts = df.recipe.value_counts()
+    best = counts.idxmax()
+    mine = [r for r in recs if r["recipe"] == best and r["ch"]]
+    hours, share = counts[best] / 4, counts[best] / len(recs)
+
+    st.success(f"**{best}** was the AI's best recipe today — chosen for **{hours:.2f} h** "
+               f"({share:.0%} of the {len(recs)} decisions so far).")
+
+    a, b = st.columns([3, 2])
+    with a:
+        names = [n for n in order if n in counts.index] + [n for n in counts.index if n not in order]
+        bar = go.Figure(go.Bar(x=[counts[n] / 4 for n in names], y=names, orientation="h",
+                               marker_color=[SERIES[0] if n == best else "#9aa5b1" for n in names],
+                               text=[f"{counts[n] / 4:.2f} h" for n in names], textposition="outside",
+                               hovertemplate="%{y}: %{x:.2f} h<extra></extra>"))
+        bar.update_layout(title="Hours each recipe was in control", height=300, margin=dict(l=10, r=10, t=40, b=10),
+                          xaxis_title="hours", yaxis=dict(autorange="reversed"))
+        st.plotly_chart(bar, key="recipe_hours")
+        tl = go.Figure(go.Scatter(x=[r["tick"] / 4 for r in recs], y=[r["recipe"] for r in recs], mode="markers",
+                                  marker=dict(size=9, color=[SERIES[0] if r["recipe"] == best else "#9aa5b1"
+                                                             for r in recs]),
+                                  hovertemplate="%{x:.2f} h → %{y}<extra></extra>"))
+        tl.update_layout(title="Which recipe was in control, through the day", height=300,
+                         margin=dict(l=10, r=10, t=40, b=10), xaxis=dict(range=[0, 24], dtick=3, ticksuffix=":00"),
+                         yaxis=dict(categoryorder="array", categoryarray=list(reversed(names))))
+        st.plotly_chart(tl, key="recipe_timeline")
+    with b:
+        if mine:
+            pick = pd.DataFrame([r["ch"] for r in mine])
+            rng = lambda c: f"{pick[c].min():.0%} – {pick[c].max():.0%} (avg {pick[c].mean():.0%})"  # noqa: E731
+            st.markdown(f"**What '{best}' looked like when chosen**")
+            st.markdown(f"- Battery reserve kept: {rng('reserve_pct')}\n"
+                        f"- Forecast caution: {rng('caution')}\n"
+                        f"- Price / clean / reliability weights: {pick.w_cost.mean():.0%} / "
+                        f"{pick.w_clean.mean():.0%} / {pick.w_reliability.mean():.0%}\n"
+                        f"- Found in the zoom-in (refine) round: {(pick.stage == 'refine').mean():.0%} of the time")
+            st.markdown(f"**When:** {_blocks([r['tick'] for r in mine])}")
+            tags = pd.Series([_tag_kind(t) for r in mine for t in r["tags"]]).value_counts()
+            st.markdown("**Conditions at the time:** " + (", ".join(f"{k} ({v}×)" for k, v in tags.head(4).items())
+                                                          if len(tags) else "all signals normal"))
+            gaps = [r["rival"]["score"] - r["ch"]["score"] for r in mine if r["rival"]]
+            risky_other = sum(1 for r in mine if any(o["name"] != best for o in r["risky"]))
+            st.markdown("**Why it kept winning**")
+            st.markdown(
+                f"- Passed the safety check and stayed within your {op.cfg.targets.get('max_shortfall_prob', 0.02):.0%} "
+                f"risk limit every time it was chosen.\n"
+                + (f"- Beat the best *other* recipe by **₹{np.mean(gaps):,.0f}** on average on the cost-vs-clean "
+                   f"score (largest margin ₹{max(gaps):,.0f}).\n" if gaps else "")
+                + (f"- In {risky_other} of {len(mine)} decisions, cheaper recipes were rejected as too risky."
+                   if risky_other else "- No cheaper recipe was rejected for risk — it simply scored best."))
+        else:
+            st.markdown("The AI was in emergency / repair mode for these decisions (supply physically short).")
+
+    st.markdown("#### 🔍 The latest decision, step by step")
+    last = recs[-1]
+    ch = last["ch"]
+    if not ch:
+        st.info(f"{last['time']}: no plan could cover all demand, so the AI used repair / safe fallback. "
+                f"{last['explanation']}")
+        return
+    opts = ds[-1].options
+    passed_safety = [o for o in opts if o["status"] != "invalid"]
+    eligible = [o for o in opts if o["status"] == "eligible"]
+    tol = op.cfg.targets.get("max_shortfall_prob", 0.02)
+    steps = [
+        ("1 · Safety", f"{len(passed_safety)} of {len(opts)} combinations passed the physics check."),
+        ("2 · Reliability", f"{len(eligible)} kept the risk of cutting critical load at or below {tol:.0%}"
+                            + (f"; {len(last['risky'])} were rejected as too risky (e.g. "
+                               f"{last['risky'][0]['name']}: {last['risky'][0]['p_shortfall']:.0%})." if last["risky"]
+                               else ".")),
+        ("3 · Cost vs clean", f"'{ch['name']}' had the best score: average ₹{ch['cost_avg_rs']:,.0f}, worst case "
+                              f"₹{ch['cost_p95_rs']:,.0f}, {ch['co2_t']:.1f} t CO₂ over the next 4 h."
+                              + (f" Runner-up '{last['rival']['name']}' scored ₹{last['rival']['score'] - ch['score']:,.0f} "
+                                 f"worse." if last["rival"] else "")),
+        ("4 · Battery life", "Used only as a tie-breaker between near-equal plans — "
+                             f"this plan cycles {ch['battery_wear_mwh']:.1f} MWh through the batteries."),
+    ]
+    for title, text in steps:
+        st.markdown(f"✅ **{title}** — {text}")
+    st.caption(f"{last['time']} · chosen combination: {ch['reserve_pct']:.0%} reserve, {(ch['caution'] or 0):.0%} "
+               f"forecast caution, weights {ch['w_cost']:.0%} / {ch['w_clean']:.0%} / {ch['w_reliability']:.0%} "
+               f"(price / clean / reliability) · found in the {ch['stage']} round out of {last['n']} combinations.")
+    top = sorted([o for o in opts if o["score"] is not None], key=lambda o: o["score"])[:6]
+    st.dataframe(pd.DataFrame([{
+        "": "✅" if o["id"] == ch["id"] else "", "Recipe": o["name"], "Reserve": f"{o['reserve_pct']:.0%}",
+        "Avg cost ₹": f"{o['cost_avg_rs']:,.0f}", "Worst case ₹": f"{o['cost_p95_rs']:,.0f}",
+        "Risk": f"{o['p_shortfall']:.0%}", "CO₂ t": f"{o['co2_t']:.1f}", "Score gap ₹": f"{o['score'] - ch['score']:,.0f}",
+        "Status": o["status"]} for o in top]), hide_index=True, width="stretch")
 
 
 # ================================================================ main

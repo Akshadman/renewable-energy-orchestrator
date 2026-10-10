@@ -39,7 +39,8 @@ def config_from_dict(raw: Dict[str, Any]) -> Config:
         agent=raw.get("agent", {}),
         data=raw.get("data", {}),
         targets={**DEFAULT_TARGETS, **(raw.get("targets") or {})},
-        schedules={"maintenance": [], "conservation": [], **(raw.get("schedules") or {})},
+        schedules={"maintenance": [], **{k: v for k, v in (raw.get("schedules") or {}).items()
+                                         if k == "maintenance"}},
         custom_profiles=raw.get("custom_profiles") or {},
         name=raw.get("name", "Default portfolio"),
     )

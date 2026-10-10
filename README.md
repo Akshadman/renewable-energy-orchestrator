@@ -2,7 +2,7 @@
 
 An **autonomous** AI control room for an industrial renewable energy portfolio. Every 15 minutes, and immediately after any shock, it decides how to run solar farms, wind farms, batteries, flexible loads and the grid connection. The goals are to **minimise cost, maximise clean energy and never cut critical load**. There is no human in the loop: the AI decides, acts and explains, and every action is logged.
 
-It works for **any industry**. You describe your site (loads, consumption data, generation resources, limits, maintenance and breakdown schedule, conservation hours, carbon and cost targets) in the dashboard, and the AI adapts.
+It works for **any industry**. You describe your site (loads, consumption data, generation resources, limits, maintenance and breakdown schedule, carbon and cost targets) in the dashboard, and the AI adapts.
 
 > **Core principle:** the AI reasons over *all* signals at once, a MILP optimizer computes the megawatts, a
 > stress test measures risk across 100 possible futures, and a validator enforces physics. An LLM, when
@@ -73,7 +73,7 @@ flowchart LR
 
    *Demand-response use* is kept at 100% by default: an A/B test showed that letting the AI restrict it raised cost by ₹2.6 L/day. It stays editable as a contractual cap.
 
-   The 9 recipes are the same ones as before (Max savings … Fortress), each now a range centred on its old setting and slightly overlapping its neighbours. Every decision, the AI **explores** 3 combinations per band (27 total), then **refines** with 6 more around the best one (33 combinations, under a second). Each combination becomes an exact MW plan via the MILP optimizer, aimed at the **day-ahead plan's** battery trajectory (re-solved after every shock). *Forecast caution* blends smoothly from expected (P50) to pessimistic (P10 renewables / P90 demand). Bands are editable per industry in the Setup tab or `config/assets.yaml`.
+   The 9 recipes are the same ones as before (Max savings … Fortress), each now a range centred on its old setting and slightly overlapping its neighbours. Every decision, the AI **explores** 3 combinations per band (27 total), then **refines** with 6 more around the best one (33 combinations, under a second). Each combination becomes an exact MW plan via the MILP optimizer, aimed at the **day-ahead plan's** battery trajectory (re-solved after every shock). *Forecast caution* blends smoothly from expected (P50) to pessimistic (P10 renewables / P90 demand). Bands are set in `config/assets.yaml` (`agent.recipes`).
 4. **Stress-test:** each combination is replayed in 100 sampled futures. Futures are drawn from the forecast uncertainty and from each alert's probability, so a 35% storm hits in about 35 of them. The result is average cost, worst-case (P95) cost, the **probability of cutting critical load**, CO₂, curtailment and battery wear.
 5. **Choose, using a priority ladder with thresholds:**
    1. *Safety:* the plan must pass the physics validator.
@@ -109,7 +109,6 @@ When a storm would threaten **critical** load (e.g. batteries nearly empty at da
 | Solar / wind farms with lat-lon and capacity; batteries | Weather → MW via standard power curves; dispatch |
 | Grid import / export limits | Hard constraints (live-derated by congestion and storms) |
 | Maintenance & breakdown schedule | Breakdowns fixed; maintenance with "± hours" is moved by the AI |
-| Energy conservation schedule | Planned demand reduction windows |
 | Annual CO₂ target, target ₹/MWh, risk tolerance, worst-case aversion | Ladder thresholds and scoring |
 
 Profiles can be saved and loaded (`config/profiles/*.yaml`). The default is a Rajasthan / Gujarat / Tamil Nadu portfolio (`config/assets.yaml`).
@@ -130,13 +129,13 @@ Profiles can be saved and loaded (`config/profiles/*.yaml`). The default is a Ra
    - **Charts:** where the power came from, battery charge vs the AI's chosen reserve, price, grid flow vs line limits.
    - **What the AI is thinking:** all signals as bars, the diagnosis, the decision and its explanation, and a table of every plan considered with its stress-test numbers and why it won or lost.
    - **Make something happen:** inject any of 11 events with parameters (storm probability and arrival, which farm breaks, how bad). The AI re-plans immediately.
-3. **📊 Results & learning:** today's AI vs business-as-usual, clean vs traditional energy, what the AI has learned (error before and after), and the Monte Carlo proof.
+3. **📊 Results & learning:** today's AI vs business-as-usual, **the best recipe of the day and why it was chosen** (hours in control, timeline, typical settings, conditions, winning margin, and a step-by-step walkthrough of the latest decision through the priority ladder), clean vs traditional energy, what the AI has learned (error before and after), and the Monte Carlo proof.
 
 ## Results
 
 100 randomized synthetic days, 3 unannounced shocks per day (storms with random probabilities, breakdowns,
 price spikes, congestion, …), offline mode. All controllers see identical weather, demand, prices and shocks.
-Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
+Reproduce with `python -m eval.evaluate --n 100`. *Measured before the energy-conservation feature was removed (the default site then had a 5% demand reduction 18:30–20:00).*
 
 | Mean per day | **AI** | Business-as-usual | No battery |
 |---|---:|---:|---:|

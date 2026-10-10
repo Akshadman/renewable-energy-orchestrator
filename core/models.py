@@ -104,7 +104,7 @@ class Config:
     agent: Dict[str, Any]
     data: Dict[str, Any]
     targets: Dict[str, Any] = field(default_factory=dict)        # industry goals (carbon, cost, risk)
-    schedules: Dict[str, Any] = field(default_factory=dict)      # maintenance / breakdowns / conservation
+    schedules: Dict[str, Any] = field(default_factory=dict)      # maintenance / breakdowns
     custom_profiles: Dict[str, List[float]] = field(default_factory=dict)  # consumer id -> 96 MW values
     name: str = "Default portfolio"
 

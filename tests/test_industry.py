@@ -29,18 +29,9 @@ def test_custom_consumption_profile_drives_demand():
     assert d[:40].mean() == pytest.approx(40, rel=0.08) and d[60:].mean() == pytest.approx(80, rel=0.08)
 
 
-def test_conservation_window_reduces_demand():
-    raw = _raw()
-    raw["schedules"] = {"maintenance": [], "conservation": [{"start": "10:00", "end": "12:00", "reduction_pct": 20}]}
-    a = Simulator(config_from_dict(raw), seed=1).profile.demand.sum(1)
-    raw["schedules"]["conservation"] = []
-    b = Simulator(config_from_dict(raw), seed=1).profile.demand.sum(1)
-    assert a[40:48] == pytest.approx(b[40:48] * 0.8) and a[0] == pytest.approx(b[0])
-
-
 def test_scheduled_breakdown_and_maintenance():
     raw = _raw()
-    raw["schedules"] = {"conservation": [], "maintenance": [
+    raw["schedules"] = {"maintenance": [
         {"asset": "S2", "start": "11:00", "hours": 2, "kind": "breakdown", "severity": 0.5},
         {"asset": "B1", "start": "15:00", "hours": 1, "kind": "maintenance", "flexible_hours": 2}]}
     sim = Simulator(config_from_dict(raw), seed=1)
@@ -53,7 +44,7 @@ def test_scheduled_breakdown_and_maintenance():
 def test_portfolio_without_wind_or_batteries_runs(tmp_path):
     raw = _raw()
     raw["wind_farms"], raw["batteries"] = [], []
-    raw["schedules"] = {"maintenance": [], "conservation": []}
+    raw["schedules"] = {"maintenance": []}
     raw["grid"]["import_limit_mw"] = 200          # solar-only site needs a bigger grid connection at night
     cfg = config_from_dict(raw)
     assert validate_config(cfg) == []

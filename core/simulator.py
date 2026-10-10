@@ -102,9 +102,6 @@ class Simulator:
             else:
                 cols.append(c.base_mw * _load_shape(c.profile, hours) * noise)
         demand = _stack(cols, T)
-        for win in cfg.schedules.get("conservation", []):  # industry's planned demand reduction
-            a, b = tick_of(win["start"], T), tick_of(win["end"], T)
-            demand[a:b] *= 1 - float(win.get("reduction_pct", 0)) / 100
         if w.source == "synthetic":
             mcp, src = self._synthetic_price(demand.sum(1) - solar.sum(1) - wind.sum(1), rng), "synthetic"
         else:
