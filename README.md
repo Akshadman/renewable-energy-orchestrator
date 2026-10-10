@@ -138,20 +138,27 @@ Profiles can be saved and loaded (`config/profiles/*.yaml`). The default is a Ra
 price spikes, congestion, …), offline mode. All controllers see identical weather, demand, prices and shocks.
 Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
 
-> ℹ️ Numbers below are from the 5-recipe-band run; a refresh for the 9-recipe version is in progress.
-
 | Mean per day | **AI** | Business-as-usual | No battery |
 |---|---:|---:|---:|
-| Cost (₹ lakh) | **72.0** (−23%) | 93.2 | 100.3 |
+| Cost (₹ lakh) | **71.9** (−23%) | 93.2 | 100.3 |
 | Clean energy | **72.5 %** | 61.9 % | 57.6 % |
 | Curtailment (MWh) | **9.9** | 22.3 | 44.1 |
 | Load cut (MWh) | **5.4** (−82%) | 29.5 | 32.3 |
 | Safety violations | **0.00** (max 0) | 4.85 | 3.59 |
-| CO₂ (t) | **554** (−42%) | 949 | 1054 |
+| CO₂ (t) | **555** (−42%) | 949 | 1054 |
 
 - **Cost:** the AI was cheaper on **100 of 100** days.
 - **Critical load cut:** the AI had some on 8 of 100 days, vs 20 for business-as-usual. These are physical shortages that no plan can cover, e.g. a storm hitting while the line is congested. The AI then protects critical load first and says so.
-- **Recipe bands vs fixed plans (A/B on the same 100 days):** bands with full demand response cost ₹71.97 L/day vs ₹72.07 L/day for 9 fixed plans (cheaper on 59/100 days, slightly less CO₂, slightly more load cut: 5.4 vs 5.2 MWh). That's a small edge near the noise level. A first version that also searched over demand-response limits was clearly worse (₹74.7 L/day). Configs and results: `eval/ab/`.
+- **Design comparison (A/B, same 100 days):**
+
+  | AI version | Cost / day | Cheaper than 9 fixed plans on |
+  |---|---:|---:|
+  | 9 fixed plans | ₹72.07 L | — |
+  | 5 recipe bands | ₹71.97 L | 59 / 100 days |
+  | **9 recipe bands (current)** | **₹71.91 L** | 56 / 100 days |
+  | 5 bands that could also restrict demand response | ₹74.67 L | 2 / 100 days |
+
+  The band designs are slightly cheaper than fixed plans (about ₹6–16k/day, close to the noise level); their main benefit is the smooth response to risk. Letting the AI restrict demand response was clearly worse, so it defaults to 100%. Configs and results: `eval/ab/`.
 - **"Safety violations"** are executed commands that broke a physical limit (SoC, rate, line, unavailable asset). Load cut is reported separately.
 
 ## Blocker → evidence
