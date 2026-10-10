@@ -17,6 +17,7 @@ try:
 except ImportError:  # optional dependency
     pass
 
+from agent.recipes import PARAM_LABELS, PARAMS, load_recipes, recipes_to_rows, rows_to_recipes
 from agent.runner import Operation
 from core.config import config_from_dict, config_to_dict, list_profiles, load_config, save_profile, validate_config
 from core.data_sources import SOURCE_LABELS, SOURCES, load_weather_day, today_ist
@@ -204,12 +205,24 @@ def setup_tab() -> None:
         aversion = tc[3].slider("Worst-case aversion", 0.0, 1.0, float(t.get("risk_aversion", 0.3)), 0.05,
                                 help="0 = only average cost matters · 1 = worst case matters as much")
 
+        st.subheader("7 · Plan recipes (ranges the AI searches inside)")
+        st.caption("Each recipe is a band: the AI tries many combinations inside these ranges every 15 minutes "
+                   "and picks the best one. Values in %. Weights are re-balanced to sum to 100%.")
+        cols_cfg = {"name": "Recipe"}
+        for prm in PARAMS:
+            short = PARAM_LABELS[prm]
+            cols_cfg[f"{prm}_min"] = st.column_config.NumberColumn(f"{short} min", min_value=0, max_value=100)
+            cols_cfg[f"{prm}_max"] = st.column_config.NumberColumn(f"{short} max", min_value=0, max_value=100)
+        recipes_df = st.data_editor(pd.DataFrame(recipes_to_rows(load_recipes(config_from_dict(raw)))),
+                                    num_rows="dynamic", key="ed_recipes", width="stretch", column_config=cols_cfg)
+
         b1, b2 = st.columns(2)
         apply = b1.form_submit_button("✅ Apply & start day", type="primary", width="stretch")
         save = b2.form_submit_button("💾 Save as profile", width="stretch")
 
     if apply or save:
         new = _build_raw(raw, name, loads, solar, wind, bats, imp, exp, maint, cons, carbon, cost, risk, aversion)
+        new["agent"] = {**new.get("agent", {}), "recipes": rows_to_recipes(recipes_df.to_dict("records"))}
         errors = validate_config(config_from_dict(new))
         if errors:
             for e in errors:
@@ -225,7 +238,7 @@ def setup_tab() -> None:
 
 
 def _clear_editors() -> None:
-    for k in ("ed_loads", "ed_solar", "ed_wind", "ed_bat", "ed_maint", "ed_cons"):
+    for k in ("ed_loads", "ed_solar", "ed_wind", "ed_bat", "ed_maint", "ed_cons", "ed_recipes"):
         ss().pop(k, None)
 
 
@@ -405,15 +418,29 @@ def thinking(op: Operation) -> None:
             st.caption(f"• {n}")
         if d.llm_error:
             st.caption(f"LLM note: {d.llm_error}")
-    st.markdown("**4 · Every plan the AI considered** — each tested against 100 possible futures")
-    rows = [{"": "✅" if o["id"] == d.chosen else ("⚠️" if o["status"] == "too risky" else
-                                                  "❌" if o["status"] == "invalid" else ""),
-             "Plan": o["name"], "Battery reserve": f"{o['reserve_pct']:.0%}",
-             "Avg cost ₹": _num(o["cost_avg_rs"]), "Worst case ₹": _num(o["cost_p95_rs"]),
-             "Risk of cutting critical load": "—" if o["p_shortfall"] is None else f"{o['p_shortfall']:.0%}",
-             "CO₂ t": "—" if o["co2_t"] is None else f"{o['co2_t']:.1f}",
-             "Why / why not": o["reason"]} for o in d.options]
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    n = len(d.options)
+    st.markdown(f"**4 · Plans considered** — {n} combinations searched inside {len({o['name'] for o in d.options})} "
+                f"recipe bands, each tested against 100 possible futures. Best combination per recipe:")
+
+    def row(o: Dict[str, Any]) -> Dict[str, Any]:
+        return {"": "✅" if o["id"] == d.chosen else ("⚠️" if o["status"] == "too risky" else
+                                                     "❌" if o["status"] == "invalid" else ""),
+                "Recipe": o["name"], "Found in": o["stage"], "Battery reserve": f"{o['reserve_pct']:.0%}",
+                "Forecast caution": f"{(o['caution'] or 0):.0%}", "DR use": f"{o['max_dr_frac']:.0%}",
+                "Price / clean / reliability": f"{o['w_cost']:.0%} / {o['w_clean']:.0%} / {o['w_reliability']:.0%}",
+                "Avg cost ₹": _num(o["cost_avg_rs"]), "Worst case ₹": _num(o["cost_p95_rs"]),
+                "Risk of cutting critical load": "—" if o["p_shortfall"] is None else f"{o['p_shortfall']:.0%}",
+                "CO₂ t": "—" if o["co2_t"] is None else f"{o['co2_t']:.1f}", "Why / why not": o["reason"]}
+
+    def rank(o: Dict[str, Any]) -> tuple:
+        return (o["id"] != d.chosen, o["status"] != "eligible", o["score"] if o["score"] is not None else 1e18)
+
+    best = {}
+    for o in sorted(d.options, key=rank):
+        best.setdefault(o["name"], o)
+    st.dataframe(pd.DataFrame([row(o) for o in sorted(best.values(), key=rank)]), hide_index=True, width="stretch")
+    with st.expander(f"See all {n} combinations"):
+        st.dataframe(pd.DataFrame([row(o) for o in sorted(d.options, key=rank)]), hide_index=True, width="stretch")
     st.caption("Priority ladder: 1 physically safe → 2 risk within your tolerance → 3 best cost-vs-clean score "
                "(weighted by your carbon target & worst-case aversion) → 4 least battery wear.")
 

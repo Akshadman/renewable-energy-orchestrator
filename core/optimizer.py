@@ -29,19 +29,24 @@ class Criteria:
     allow_shedding: bool = False
     allow_unserved: bool = False
     max_export_mw: Optional[float] = None
+    caution: Optional[float] = None        # 0 = plan on P50 … 1 = plan on P10 renewables / P90 demand
+    max_dr_frac: float = 1.0               # share of eligible flexible load the AI may reduce via DR
 
     def normalized(self) -> "Criteria":
         """Clamp inputs and rescale the weights to sum to one."""
         w = np.clip([self.w_cost, self.w_clean, self.w_reliability], 0.0, None)
         w = w / w.sum() if w.sum() > 0 else np.array([0.5, 0.3, 0.2])
         mode = self.uncertainty_mode if self.uncertainty_mode in ("p10", "p50") else "p50"
+        caution = (1.0 if mode == "p10" else 0.0) if self.caution is None else float(np.clip(self.caution, 0, 1))
         return replace(self, w_cost=float(w[0]), w_clean=float(w[1]), w_reliability=float(w[2]),
-                       reserve_pct=float(np.clip(self.reserve_pct, 0.0, 0.9)), uncertainty_mode=mode)
+                       reserve_pct=float(np.clip(self.reserve_pct, 0.0, 0.9)), uncertainty_mode=mode,
+                       caution=caution, max_dr_frac=float(np.clip(self.max_dr_frac, 0.0, 1.0)))
 
     def relaxed(self, attempt: int) -> "Criteria":
         """Progressively looser constraints: attempt 1 lowers reserve & allows import + shedding,
         attempt 2 additionally permits unserved load (always feasible, validator will judge)."""
-        c = replace(self, reserve_pct=max(0.0, self.reserve_pct * 0.5), allow_import=True, allow_shedding=True)
+        c = replace(self, reserve_pct=max(0.0, self.reserve_pct * 0.5), allow_import=True, allow_shedding=True,
+                    max_dr_frac=1.0)
         return replace(c, allow_unserved=True, max_export_mw=None) if attempt >= 2 else c
 
     def to_dict(self) -> Dict[str, Any]:
@@ -83,11 +88,10 @@ def _solve(st: GridState, fc: Forecast, cfg: Config, cr: Criteria, limit: float,
     H, dt, m = fc.horizon, TICK_HOURS, cfg.market
     B, S, W, C = range(len(cfg.batteries)), range(len(cfg.solar)), range(len(cfg.wind)), range(len(cfg.consumers))
     T = range(H)
-    q_ren = "p10" if cr.uncertainty_mode == "p10" else "p50"
-    q_dem = "p90" if cr.uncertainty_mode == "p10" else "p50"
-    solar = fc.solar[q_ren].copy()
-    wind = fc.wind[q_ren].copy()
-    demand = fc.demand[q_dem].copy()
+    k = float(cr.caution or 0.0)          # blend expected → pessimistic forecast continuously
+    solar = fc.solar["p50"] - k * (fc.solar["p50"] - fc.solar["p10"])
+    wind = fc.wind["p50"] - k * (fc.wind["p50"] - fc.wind["p10"])
+    demand = fc.demand["p50"] + k * (fc.demand["p90"] - fc.demand["p50"])
     solar[0], wind[0], demand[0] = st.solar_mw, st.wind_mw, st.demand_mw        # lead 0 = observed
     mcp = fc.price["p50"]
     buy = mcp + m.buy_adder
@@ -119,7 +123,7 @@ def _solve(st: GridState, fc: Forecast, cfg: Config, cr: Criteria, limit: float,
     gdir = {t: V(f"g_{t}", **bin_kw) for t in T}
     cs = {(s, t): V(f"cs_{s}_{t}", 0, solar[t, s]) for s in S for t in T}
     cw = {(w, t): V(f"cw_{w}_{t}", 0, wind[t, w]) for w in W for t in T}
-    dr = {(c, t): V(f"dr_{c}_{t}", 0, flex[t, c] * elig[c]) for c in C for t in T}
+    dr = {(c, t): V(f"dr_{c}_{t}", 0, flex[t, c] * elig[c] * cr.max_dr_frac) for c in C for t in T}
     shed = {(c, t): V(f"shed_{c}_{t}", 0, flex[t, c] if cr.allow_shedding else 0) for c in C for t in T}
     uc = {(c, t): V(f"uc_{c}_{t}", 0, crit[t, c] if cr.allow_unserved else 0) for c in C for t in T}
     rs = {t: V(f"rs_{t}", 0) for t in T}

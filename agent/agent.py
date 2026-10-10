@@ -4,7 +4,8 @@ Every 15 minutes (and immediately after any shock), with a day-ahead plan as the
 
   PERCEIVE    state, learned-corrected P10/P50/P90 forecasts, prices, alerts (with probabilities)
   DIAGNOSE    continuous risk signals, all measured together (no situation labels)
-  OPTIONS     the MILP optimizer produces a spread of candidate plans (cheapest … safest)
+  OPTIONS     recipes are *bands* (a range per parameter); the AI explores combinations across all
+              bands, then refines around the best one — each combination is a MILP-optimised plan
   STRESS-TEST each plan is replayed across ~100 sampled futures → avg ₹, worst-case ₹, P(shortfall)
   CHOOSE      priority ladder with thresholds: Safety > Reliability (≤ tolerance) > Cost vs Clean
               (weighted by industry targets) > Battery life; optional LLM may pick among eligible plans
@@ -25,6 +26,7 @@ import numpy as np
 
 from agent.narrator import diagnosis_text, explain
 from agent.prompts import SYSTEM_PROMPT, tick_brief
+from agent.recipes import PARAMS, Recipe, explore, load_recipes, refine, to_criteria
 from agent.signals import Signals, diagnose
 from agent.stress_test import StressResult, sample_futures, stress_test
 from agent.tools import SUBMIT_DECISION, build_briefing
@@ -40,28 +42,6 @@ from core.validator import ValidationResult, validate
 DEFAULT_LOG = ROOT / "logs" / "decisions.jsonl"
 DEFAULT_MODEL = "claude-sonnet-5"
 
-# Candidate plans: a fine ladder of protection levels (battery reserve 10% → 85%) with weights that
-# shift smoothly from cost-lean to reliability-lean, plus one green-lean plan. The stress test scores
-# every rung against the *probabilities* of the futures, so the chosen protection rises gradually as
-# risk rises instead of jumping between fixed cases.
-def _rung(reserve: float) -> Criteria:
-    x = (reserve - 0.10) / 0.75                      # 0 at the cheapest rung, 1 at the safest
-    return Criteria(0.65 - 0.50 * x, 0.20 - 0.10 * x, 0.15 + 0.60 * x, reserve, "p10" if reserve >= 0.5 else "p50")
-
-
-OPTION_GRID: List[Tuple[str, Criteria]] = [
-    ("Max savings", _rung(0.10)),
-    ("Lean", _rung(0.20)),
-    ("Balanced", _rung(0.30)),
-    ("Green-lean", Criteria(0.30, 0.55, 0.15, 0.30, "p50")),
-    ("Steady", _rung(0.40)),
-    ("Cautious", _rung(0.50)),
-    ("Protective", _rung(0.62)),
-    ("Strong reserve", _rung(0.74)),
-    ("Fortress", _rung(0.85)),
-]
-
-
 # ---------------------------------------------------------------- records
 @dataclass
 class Option:
@@ -74,6 +54,8 @@ class Option:
     status: str = "invalid"           # eligible | too risky | invalid
     reason: str = ""
     score: float = float("inf")
+    point: Dict[str, float] = field(default_factory=dict)   # the parameter combination inside the band
+    stage: str = "explore"            # explore | refine
 
     @property
     def action(self) -> Optional[Action]:
@@ -82,8 +64,10 @@ class Option:
     def row(self) -> Dict[str, Any]:
         s = self.stress
         return jsonable({
-            "id": self.id, "name": self.name, "reserve_pct": self.criteria.reserve_pct,
-            "forecast": self.criteria.uncertainty_mode, "status": self.status, "reason": self.reason,
+            "id": self.id, "name": self.name, "stage": self.stage, "reserve_pct": self.criteria.reserve_pct,
+            "w_cost": self.criteria.w_cost, "w_clean": self.criteria.w_clean,
+            "w_reliability": self.criteria.w_reliability, "caution": self.criteria.caution,
+            "max_dr_frac": self.criteria.max_dr_frac, "status": self.status, "reason": self.reason,
             "cost_avg_rs": s.cost_avg if s else None, "cost_p95_rs": s.cost_p95 if s else None,
             "p_shortfall": s.p_shortfall if s else None, "co2_t": s.co2_t if s else None,
             "curtailed_mwh": s.curtailed_mwh if s else None, "battery_wear_mwh": s.battery_throughput_mwh if s else None,
@@ -159,6 +143,9 @@ class OrchestratorAgent:
         self.n_futures = int(n_futures or a.get("scenarios", 100))
         self.llm_every_n = int(llm_every_n or a.get("llm_every_n_ticks", 8))
         self.max_relax = int(a.get("max_relax_attempts", 2))
+        self.recipes: List[Recipe] = load_recipes(config)
+        self.explore_per_recipe = int(a.get("explore_per_recipe", 3))
+        self.refine_n = int(a.get("refine_candidates", 6))
         path = resolve_path(config.data.get("learning_file", "data/learning.json")) if persist_learning else None
         self.learner = ForecastLearner(lead=4, rate=float(a.get("learning_rate", 0.15)), path=path)
         self.forecaster = Forecaster(sim, learner=self.learner)
@@ -211,25 +198,14 @@ class OrchestratorAgent:
         # OPTIONS + STRESS-TEST
         futures = sample_futures(st, fc, cfg, sig.storms, self.n_futures, seed=sim.seed * 7919 + st.tick)
         target = self._da_soc.get(st.tick + H - 1)
-        crits = [self._tune(base, sig) for _, base in OPTION_GRID]
-        solve = lambda c: optimize(st, fc, cfg, c, soc_target_mwh=target)  # noqa: E731
-        if self.parallel:   # each CBC solve is a separate process → threads give real parallelism
-            with ThreadPoolExecutor(max_workers=min(len(crits), os.cpu_count() or 1)) as pool:
-                results = list(pool.map(solve, crits))
-        else:
-            results = [solve(c) for c in crits]
-        options = []
-        for k, ((name, _), crit, res) in enumerate(zip(OPTION_GRID, crits, results)):
-            opt = Option(f"O{k + 1}", name, crit, res)
-            if res.status == "optimal":
-                opt.validation = validate(res.action, st, cfg)
-                if opt.validation.passed:
-                    opt.stress = stress_test(res.action, res.plan, st, fc, cfg, futures)
-                else:
-                    opt.reason = "fails physics check: " + "; ".join(opt.validation.violations)
-            else:
-                opt.reason = f"optimizer: {res.status}"
-            options.append(opt)
+        rng = np.random.default_rng(sim.seed * 104_729 + st.tick)
+        options = self._evaluate(explore(self.recipes, rng, self.explore_per_recipe), "explore",
+                                 st, fc, futures, target, sig, [])
+        best, _ = self._ladder(options, sig)
+        if best is not None and self.refine_n > 0:                      # zoom in around the winner
+            recipe = next(r for r in self.recipes if r.name == best.name)
+            options += self._evaluate(refine(recipe, best.point, rng, self.refine_n), "refine",
+                                      st, fc, futures, target, sig, options)
         # CHOOSE (priority ladder)
         chosen, eligible = self._ladder(options, sig)
         reasoner, llm_error, diag, expl = "offline", "", diagnosis_text(headline), ""
@@ -288,6 +264,31 @@ class OrchestratorAgent:
             self.step()
         return self.decisions
 
+    # ------------------------------------------------------------ options
+    def _evaluate(self, cands: List[Tuple[Recipe, Dict[str, float]]], stage: str, st: GridState, fc: Forecast,
+                  futures: Any, target: Optional[float], sig: Signals, existing: List["Option"]) -> List["Option"]:
+        """Optimise, validate and stress-test each parameter combination."""
+        crits = [self._tune(to_criteria(pt), sig) for _, pt in cands]
+        solve = lambda c: optimize(st, fc, self.cfg, c, soc_target_mwh=target)  # noqa: E731
+        if self.parallel:   # each CBC solve is a separate process → threads give real parallelism
+            with ThreadPoolExecutor(max_workers=min(len(crits), os.cpu_count() or 1)) as pool:
+                results = list(pool.map(solve, crits))
+        else:
+            results = [solve(c) for c in crits]
+        out = []
+        for (recipe, pt), crit, res in zip(cands, crits, results):
+            opt = Option(f"O{len(existing) + len(out) + 1}", recipe.name, crit, res, point=dict(pt), stage=stage)
+            if res.status == "optimal":
+                opt.validation = validate(res.action, st, self.cfg)
+                if opt.validation.passed:
+                    opt.stress = stress_test(res.action, res.plan, st, fc, self.cfg, futures)
+                else:
+                    opt.reason = "fails physics check: " + "; ".join(opt.validation.violations)
+            else:
+                opt.reason = f"optimizer: {res.status}"
+            out.append(opt)
+        return out
+
     # ------------------------------------------------------------ diagnose & choose
     def _diagnose(self, st: GridState, fc: Forecast, alerts: list) -> Signals:
         sim, cfg = self.sim, self.cfg
@@ -303,8 +304,9 @@ class OrchestratorAgent:
 
     def _tune(self, base: Criteria, sig: Signals) -> Criteria:
         """Industry targets shift every option's weights continuously (more CO₂ pressure → greener)."""
+        from dataclasses import replace as _replace
         clean = base.w_clean * float(np.clip(sig.carbon_pressure, 0.5, 3.0))
-        return Criteria(base.w_cost, clean, base.w_reliability, base.reserve_pct, base.uncertainty_mode).normalized()
+        return _replace(base, w_clean=clean).normalized()
 
     def _tolerance(self) -> float:
         return float(self.cfg.targets.get("max_shortfall_prob", 0.02))
@@ -347,7 +349,8 @@ class OrchestratorAgent:
 
     def _repair(self, st: GridState, fc: Forecast, options: List[Option]) -> Tuple[Action, str, Criteria]:
         """No option passed: relax constraints (shedding, then unserved) and retry; else safe fallback."""
-        base = OPTION_GRID[-2][1]
+        fortress = max(self.recipes, key=lambda r: r.bands["reserve_pct"][1])
+        base = to_criteria(fortress.centre())
         for attempt in range(1, self.max_relax + 1):
             crit = base.relaxed(attempt)
             res = optimize(st, fc, self.cfg, crit)

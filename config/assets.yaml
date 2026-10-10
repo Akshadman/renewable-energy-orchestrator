@@ -55,6 +55,15 @@ agent:
   llm_every_n_ticks: 8         # re-consult LLM at least this often
   max_relax_attempts: 2
   scenarios: 100               # stress-test futures per candidate plan
+  explore_per_recipe: 3        # combinations tried in every recipe band (centre + spread)
+  refine_candidates: 6         # extra combinations around the best one found
+  recipes:                     # each parameter is a [min, max] band the AI searches inside (fractions)
+                               # max_dr_frac = cap on demand response; restricting it raised cost in A/B tests
+    - {name: Max savings, reserve_pct: [0.05, 0.30], w_cost: [0.55, 0.80], w_clean: [0.10, 0.30], w_reliability: [0.05, 0.20], caution: [0.0, 0.3], max_dr_frac: [1.0, 1.0]}
+    - {name: Green-lean,  reserve_pct: [0.15, 0.45], w_cost: [0.20, 0.40], w_clean: [0.45, 0.70], w_reliability: [0.10, 0.25], caution: [0.0, 0.4], max_dr_frac: [1.0, 1.0]}
+    - {name: Balanced,    reserve_pct: [0.20, 0.50], w_cost: [0.35, 0.55], w_clean: [0.20, 0.40], w_reliability: [0.20, 0.35], caution: [0.2, 0.6], max_dr_frac: [1.0, 1.0]}
+    - {name: Protective,  reserve_pct: [0.45, 0.75], w_cost: [0.20, 0.40], w_clean: [0.10, 0.25], w_reliability: [0.40, 0.65], caution: [0.5, 0.9], max_dr_frac: [1.0, 1.0]}
+    - {name: Fortress,    reserve_pct: [0.70, 0.90], w_cost: [0.10, 0.25], w_clean: [0.05, 0.15], w_reliability: [0.60, 0.85], caution: [0.8, 1.0], max_dr_frac: [1.0, 1.0]}
   learning_rate: 0.15          # EMA step for forecast-bias learning
 
 data:

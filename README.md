@@ -42,7 +42,7 @@ flowchart LR
     end
     IN --> PER[PERCEIVE<br/>state + learned P10/P50/P90<br/>forecasts + alerts with probabilities]
     PER --> DIA[DIAGNOSE<br/>9 continuous signals,<br/>all measured together]
-    DIA --> OPT[OPTIONS<br/>MILP builds 9 plans:<br/>10% → 85% battery reserve]
+    DIA --> OPT[OPTIONS<br/>search inside 5 recipe bands:<br/>explore 15 → refine 6 combinations]
     OPT --> ST[STRESS-TEST<br/>each plan × 100 futures<br/>avg ₹ · worst ₹ · P shortfall]
     ST --> CH[CHOOSE<br/>priority ladder<br/>± Claude among eligible]
     CH --> VER{VERIFY<br/>physics validator}
@@ -57,8 +57,20 @@ flowchart LR
 
 1. **Perceive:** current state, forecasts already corrected by what the AI has learned, prices, and alerts that carry a **probability** (e.g. "storm 35% likely in 90 min").
 2. **Diagnose:** nine continuous signals, measured together: storm probability, price vs normal, grid-line headroom, batteries in service, generation offline, demand surprise, renewable shortfall, battery charge, CO₂ budget pace. A storm and a price spike at the same time are both kept and both affect the decision.
-3. **Options:** the MILP optimizer builds 9 candidate plans, from "Max savings" (10% battery reserve) to "Fortress" (85%), plus a green-leaning plan. All of them aim at the **day-ahead plan's** battery trajectory, which is re-solved after every shock.
-4. **Stress-test:** each plan is replayed in 100 sampled futures. Futures are drawn from the forecast uncertainty and from each alert's probability, so a 35% storm hits in about 35 of them. The result is average cost, worst-case (P95) cost, the **probability of cutting critical load**, CO₂, curtailment and battery wear.
+3. **Options, as recipe bands.** A recipe isn't one fixed setting but a **range for every parameter**:
+
+   | Recipe | Battery reserve | Price sensitivity | Clean weight | Reliability weight | Forecast caution | Demand-response use |
+   |---|---|---|---|---|---|---|
+   | Max savings | 5–30% | 55–80% | 10–30% | 5–20% | 0–30% | 100% |
+   | Green-lean | 15–45% | 20–40% | 45–70% | 10–25% | 0–40% | 100% |
+   | Balanced | 20–50% | 35–55% | 20–40% | 20–35% | 20–60% | 100% |
+   | Protective | 45–75% | 20–40% | 10–25% | 40–65% | 50–90% | 100% |
+   | Fortress | 70–90% | 10–25% | 5–15% | 60–85% | 80–100% | 100% |
+
+   *Demand-response use* is kept at 100% by default: an A/B test showed that letting the AI restrict it raised cost by ₹2.6 L/day. It stays editable as a contractual cap.
+
+   Every decision, the AI **explores** 3 combinations per band (15 total), then **refines** with 6 more around the best one. Each combination becomes an exact MW plan via the MILP optimizer, aimed at the **day-ahead plan's** battery trajectory (re-solved after every shock). *Forecast caution* blends smoothly from expected (P50) to pessimistic (P10 renewables / P90 demand). Bands are editable per industry in the Setup tab or `config/assets.yaml`.
+4. **Stress-test:** each combination is replayed in 100 sampled futures. Futures are drawn from the forecast uncertainty and from each alert's probability, so a 35% storm hits in about 35 of them. The result is average cost, worst-case (P95) cost, the **probability of cutting critical load**, CO₂, curtailment and battery wear.
 5. **Choose, using a priority ladder with thresholds:**
    1. *Safety:* the plan must pass the physics validator.
    2. *Reliability:* shortfall risk must be within **your** tolerance (default 2%).
@@ -66,7 +78,7 @@ flowchart LR
    4. *Battery life:* among near-equal plans, pick the one with the least wear.
 
    With an API key, Claude sees the whole briefing and may pick a different **eligible** plan, with its reasoning. Anything else is rejected by code.
-6. **Verify → act → explain:** validate again; if nothing is valid, repair (allow controlled flexible-load reduction), then fall back to the safe controller. Then execute and write a 2–3 sentence explanation, e.g. *"I compared 9 plans across 100 futures and chose 'Protective' (≥62% reserve)… 'Max savings' would save ₹84,597 but risks a critical shortfall in 54% of futures (limit 2%)."*
+6. **Verify → act → explain:** validate again; if nothing is valid, repair (allow controlled flexible-load reduction), then fall back to the safe controller. Then execute and write a 2–3 sentence explanation, e.g. *"I tested 21 combinations from 5 recipe bands across 100 futures and chose a 'Protective' plan (≥67% reserve)… 'Max savings' would save ₹84,597 but risks a critical shortfall in 54% of futures (limit 2%)."*
 7. **Learn:** compare every 1-hour-ahead forecast with what happened, learn each resource's bias and how wide the P10–P90 band should be, apply that immediately, and save it to `data/learning.json` for the next day.
 
 **Operations, also autonomous:** maintenance jobs that may move are shifted into the slot that loses the least energy × price. Breakdowns get an inspection crew immediately, which shortens the outage.
@@ -75,9 +87,12 @@ flowchart LR
 
 The chosen protection depends on *how likely* a risk is, through the stress test rather than a rule. Measured on one simulated day with a storm forecast at 18:00 (`tests/test_agent.py::test_protection_rises_with_storm_probability`):
 
-| Storm probability | 0% | 5–50% | 70%+ |
-|---|---|---|---|
-| Chosen plan (battery reserve) | Max savings (10%) | Strong reserve (74%) | Fortress (85%) |
+| Storm probability | 0% | 10% | 50% | 90% |
+|---|---|---|---|---|
+| Battery reserve chosen | 17% | 41% | 49% | 57% |
+| Forecast caution | 15% | 34% | 89% | 89% |
+
+Because the AI searches *inside* the recipe bands, protection rises smoothly with the risk instead of jumping between a few fixed plans.
 
 When a storm would threaten **critical** load (e.g. batteries nearly empty at dawn), any probability above your tolerance triggers protection, because that is what "2% acceptable risk" means. Raise the tolerance slider and the AI accepts more risk for lower cost.
 
@@ -121,15 +136,16 @@ Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
 
 | Mean per day | **AI** | Business-as-usual | No battery |
 |---|---:|---:|---:|
-| Cost (₹ lakh) | **71.9** (−23%) | 93.0 | 100.1 |
-| Clean energy | **72.4 %** | 61.9 % | 57.6 % |
-| Curtailment (MWh) | **11.0** | 22.5 | 44.2 |
-| Load cut (MWh) | **5.2** (−82%) | 29.5 | 32.3 |
-| Safety violations | **0.00** (max 0) | 4.84 | 3.59 |
-| CO₂ (t) | **556** (−41%) | 947 | 1053 |
+| Cost (₹ lakh) | **72.0** (−23%) | 93.2 | 100.3 |
+| Clean energy | **72.5 %** | 61.9 % | 57.6 % |
+| Curtailment (MWh) | **9.9** | 22.3 | 44.1 |
+| Load cut (MWh) | **5.4** (−82%) | 29.5 | 32.3 |
+| Safety violations | **0.00** (max 0) | 4.85 | 3.59 |
+| CO₂ (t) | **554** (−42%) | 949 | 1054 |
 
 - **Cost:** the AI was cheaper on **100 of 100** days.
-- **Critical load cut:** the AI had some on 7 of 100 days, vs 20 for business-as-usual. These are physical shortages that no plan can cover, e.g. a storm hitting while the line is congested. The AI then protects critical load first and says so.
+- **Critical load cut:** the AI had some on 8 of 100 days, vs 20 for business-as-usual. These are physical shortages that no plan can cover, e.g. a storm hitting while the line is congested. The AI then protects critical load first and says so.
+- **Recipe bands vs fixed plans (A/B on the same 100 days):** bands with full demand response cost ₹71.97 L/day vs ₹72.07 L/day for 9 fixed plans (cheaper on 59/100 days, slightly less CO₂, slightly more load cut: 5.4 vs 5.2 MWh). That's a small edge near the noise level. A first version that also searched over demand-response limits was clearly worse (₹74.7 L/day). Configs and results: `eval/ab/`.
 - **"Safety violations"** are executed commands that broke a physical limit (SoC, rate, line, unavailable asset). Load cut is reported separately.
 
 ## Blocker → evidence
@@ -151,7 +167,8 @@ Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
 
 | Path | What it does |
 |---|---|
-| `agent/agent.py` | The autonomous loop (perceive → … → learn), option ladder, repair, operations |
+| `agent/agent.py` | The autonomous loop (perceive → … → learn), priority ladder, repair, operations |
+| `agent/recipes.py` | Recipe bands, explore / refine search |
 | `agent/signals.py` | DIAGNOSE: continuous signals and human-readable headline |
 | `agent/stress_test.py` | Future sampling (forecast quantiles + storm probabilities) and plan replay |
 | `agent/narrator.py`, `prompts.py`, `tools.py` | Offline explanations; LLM prompt and the single `submit_decision` tool |
@@ -166,4 +183,4 @@ Reproduce with `python -m eval.evaluate --n 100` (about 13 min on 8 cores).
 - Single-bus model; frequency is a proportional proxy of imbalance.
 - Demand comes from shapes or your uploaded data; prices are a labelled sample until a real IEX file is added.
 - Forecasts are simulated (future truth + bias + noise), not a trained weather model; learning corrects bias and calibration only.
-- The option ladder has 9 discrete protection levels, so the response to risk is graded in steps, not perfectly continuous.
+- The band search samples 21 combinations per decision. It finds very good combinations, but not a mathematically proven optimum (that would need full stochastic optimisation).

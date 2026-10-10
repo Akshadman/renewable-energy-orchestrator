@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.agent import OPTION_GRID, LLMReasoner, OrchestratorAgent
+from agent.agent import LLMReasoner, OrchestratorAgent
+from agent.recipes import DEFAULT_RECIPES, PARAMS, load_recipes
 from agent.runner import Operation
 from core.events import make_event
 from core.simulator import Simulator
@@ -36,7 +37,7 @@ def test_full_autonomous_day(cfg, tmp_path):
     lines = (tmp_path / "log.jsonl").read_text().splitlines()
     assert len(lines) == 96
     rec = json.loads(lines[-1])
-    assert len(rec["options"]) == len(OPTION_GRID) and rec["explanation"] and rec["validation"]["passed"]
+    assert len(rec["options"]) >= len(DEFAULT_RECIPES) and rec["explanation"] and rec["validation"]["passed"]
     assert not hasattr(agent, "pending_approvals")            # no human in the loop
 
 
@@ -44,9 +45,36 @@ def test_every_option_is_stress_tested_and_ranked(cfg, tmp_path):
     sim, agent = _agent(cfg, tmp_path)
     d = agent.step()
     tested = [o for o in d.options if o["cost_avg_rs"] is not None]
-    assert len(tested) >= len(OPTION_GRID) - 1
+    assert len(tested) >= len(DEFAULT_RECIPES) * 2
     assert all(0 <= o["p_shortfall"] <= 1 and o["cost_p95_rs"] >= o["cost_avg_rs"] - 1e-6 for o in tested)
     assert sum(o["reason"] == "chosen" for o in d.options) == 1
+
+
+def test_band_search_stays_inside_bands_and_refines(cfg, tmp_path):
+    sim, agent = _agent(cfg, tmp_path)
+    d = agent.step()
+    bands = {r.name: r.bands for r in load_recipes(cfg)}
+    assert {o["stage"] for o in d.options} == {"explore", "refine"}
+    assert {o["name"] for o in d.options} == set(bands)
+    for o in d.options:                                   # reserve & caution & DR stay inside the recipe band
+        for p in ("reserve_pct", "caution", "max_dr_frac"):
+            lo, hi = bands[o["name"]][p]
+            assert lo - 1e-6 <= o[p] <= hi + 1e-6, (o["name"], p, o[p])
+    reserves = {round(o["reserve_pct"], 3) for o in d.options}
+    assert len(reserves) > len(bands)                     # many distinct points, not one per recipe
+
+
+def test_industry_can_define_own_recipe_bands(cfg, tmp_path):
+    cfg.agent["recipes"] = [{"name": "Only cautious", "reserve_pct": [0.5, 0.6], "w_cost": [0.3, 0.3],
+                             "w_clean": [0.2, 0.2], "w_reliability": [0.5, 0.5], "caution": [0.5, 0.5],
+                             "max_dr_frac": [1, 1]}]
+    try:
+        sim, agent = _agent(cfg, tmp_path)
+        d = agent.step()
+        assert {o["name"] for o in d.options} == {"Only cautious"}
+        assert all(0.5 - 1e-6 <= o["reserve_pct"] <= 0.6 + 1e-6 for o in d.options)
+    finally:
+        cfg.agent.pop("recipes")
 
 
 def _protection_for(cfg, tmp_path, prob, tick=72):

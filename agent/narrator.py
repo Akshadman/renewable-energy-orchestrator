@@ -22,8 +22,9 @@ def explain(chosen: Dict[str, Any], options: List[Dict[str, Any]], tolerance: fl
     if fallback:
         return ("Supply is physically short of demand right now and no optimised plan passed the safety checks, "
                 f"so the safe fallback controller acted, protecting critical load first. This tick I {summary}.")
-    first = (f"I compared {len(options)} plans across {n_futures} possible futures and chose "
-             f"'{chosen['name']}' (keep ≥{chosen['reserve_pct']:.0%} battery reserve): expected cost "
+    recipes = len({o["name"] for o in options})
+    first = (f"I tested {len(options)} combinations from {recipes} recipe bands across {n_futures} possible "
+             f"futures and chose a '{chosen['name']}' plan (keep ≥{chosen['reserve_pct']:.0%} battery reserve): expected cost "
              f"₹{chosen['cost_avg_rs']:,.0f}, worst case ₹{chosen['cost_p95_rs']:,.0f}, "
              f"shortfall risk {chosen['p_shortfall']:.0%}.")
     cheaper = [o for o in options if o.get("cost_avg_rs") is not None

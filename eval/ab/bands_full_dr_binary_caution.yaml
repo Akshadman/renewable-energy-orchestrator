@@ -1,0 +1,267 @@
+name: Default portfolio
+sim:
+  tick_minutes: 15
+  ticks_per_day: 96
+  timezone: Asia/Kolkata
+  frequency_nominal_hz: 50.0
+  frequency_sensitivity_hz: 0.5
+  nowcast_error: 0.03
+  forecast_bias:
+    solar: -0.04
+    wind: 0.12
+    demand: 0.03
+solar_farms:
+- id: S1
+  name: Bhadla (RJ)
+  capacity_mw: 60
+  lat: 27.54
+  lon: 71.92
+  performance_ratio: 0.9
+  cloud_sensitivity: 1.0
+- id: S2
+  name: Jodhpur (RJ)
+  capacity_mw: 45
+  lat: 26.24
+  lon: 73.02
+  performance_ratio: 0.88
+  cloud_sensitivity: 0.9
+- id: S3
+  name: Jaisalmer (RJ)
+  capacity_mw: 40
+  lat: 26.91
+  lon: 70.91
+  performance_ratio: 0.9
+  cloud_sensitivity: 0.8
+- id: S4
+  name: Charanka (GJ)
+  capacity_mw: 30
+  lat: 23.9
+  lon: 71.2
+  performance_ratio: 0.87
+  cloud_sensitivity: 1.1
+- id: S5
+  name: Dholera (GJ)
+  capacity_mw: 20
+  lat: 22.25
+  lon: 72.19
+  performance_ratio: 0.86
+  cloud_sensitivity: 1.2
+wind_farms:
+- id: W1
+  name: Kutch (GJ)
+  capacity_mw: 80
+  lat: 23.25
+  lon: 69.67
+  cut_in_ms: 3.0
+  rated_ms: 12.0
+  cut_out_ms: 25.0
+- id: W2
+  name: Muppandal (TN)
+  capacity_mw: 50
+  lat: 8.26
+  lon: 77.55
+  cut_in_ms: 3.5
+  rated_ms: 12.5
+  cut_out_ms: 25.0
+- id: W3
+  name: Dwarka (GJ)
+  capacity_mw: 30
+  lat: 22.24
+  lon: 68.97
+  cut_in_ms: 3.0
+  rated_ms: 11.5
+  cut_out_ms: 24.0
+batteries:
+- id: B1
+  name: BESS-Bhadla
+  energy_mwh: 50
+  power_mw: 25
+  round_trip_eff: 0.9
+  soc_min: 0.1
+  soc_max: 0.95
+  soc_init: 0.5
+  degradation_cost: 450
+- id: B2
+  name: BESS-Kutch
+  energy_mwh: 100
+  power_mw: 40
+  round_trip_eff: 0.9
+  soc_min: 0.1
+  soc_max: 0.95
+  soc_init: 0.5
+  degradation_cost: 400
+consumers:
+- id: C1
+  name: Steel mill
+  base_mw: 60
+  critical_frac: 0.6
+  dr_eligible: true
+  profile: industrial
+- id: C2
+  name: Cement plant
+  base_mw: 45
+  critical_frac: 0.55
+  dr_eligible: true
+  profile: industrial
+- id: C3
+  name: Textile park
+  base_mw: 35
+  critical_frac: 0.55
+  dr_eligible: true
+  profile: commercial
+- id: C4
+  name: Data centre
+  base_mw: 30
+  critical_frac: 0.9
+  dr_eligible: false
+  profile: flat
+grid:
+  import_limit_mw: 120
+  export_limit_mw: 70
+  carbon_intensity_t_per_mwh: 0.72
+market:
+  base_price: 4500
+  buy_adder: 400
+  sell_factor: 0.92
+  carbon_price: 1500
+  dr_incentive: 3500
+  curtailment_penalty: 1500
+  voll_flexible: 20000
+  voll_critical: 200000
+  reserve_shortfall_penalty: 6000
+  deviation_penalty: 2000
+agent:
+  horizon: 16
+  llm_every_n_ticks: 8
+  max_relax_attempts: 2
+  scenarios: 100
+  explore_per_recipe: 3
+  refine_candidates: 6
+  recipes:
+  - name: Max savings
+    reserve_pct:
+    - 0.05
+    - 0.3
+    w_cost:
+    - 0.55
+    - 0.8
+    w_clean:
+    - 0.1
+    - 0.3
+    w_reliability:
+    - 0.05
+    - 0.2
+    caution:
+    - 0.0
+    - 0.0
+    max_dr_frac:
+    - 1.0
+    - 1.0
+  - name: Green-lean
+    reserve_pct:
+    - 0.15
+    - 0.45
+    w_cost:
+    - 0.2
+    - 0.4
+    w_clean:
+    - 0.45
+    - 0.7
+    w_reliability:
+    - 0.1
+    - 0.25
+    caution:
+    - 0.0
+    - 0.0
+    max_dr_frac:
+    - 1.0
+    - 1.0
+  - name: Balanced
+    reserve_pct:
+    - 0.2
+    - 0.5
+    w_cost:
+    - 0.35
+    - 0.55
+    w_clean:
+    - 0.2
+    - 0.4
+    w_reliability:
+    - 0.2
+    - 0.35
+    caution:
+    - 0.0
+    - 0.0
+    max_dr_frac:
+    - 1.0
+    - 1.0
+  - name: Protective
+    reserve_pct:
+    - 0.45
+    - 0.75
+    w_cost:
+    - 0.2
+    - 0.4
+    w_clean:
+    - 0.1
+    - 0.25
+    w_reliability:
+    - 0.4
+    - 0.65
+    caution:
+    - 1.0
+    - 1.0
+    max_dr_frac:
+    - 1.0
+    - 1.0
+  - name: Fortress
+    reserve_pct:
+    - 0.7
+    - 0.9
+    w_cost:
+    - 0.1
+    - 0.25
+    w_clean:
+    - 0.05
+    - 0.15
+    w_reliability:
+    - 0.6
+    - 0.85
+    caution:
+    - 1.0
+    - 1.0
+    max_dr_frac:
+    - 1.0
+    - 1.0
+  learning_rate: 0.15
+data:
+  iex_prices_csv: data/iex_prices.csv
+  replay_dir: data/replay
+  cache_dir: data/cache
+  cache_ttl_minutes: 60
+  api_timeout_s: 10
+  storm_weather_codes:
+  - 95
+  - 96
+  - 99
+  - 65
+  - 67
+  - 82
+  storm_wind_ms: 20.0
+  learning_file: data/learning.json
+targets:
+  annual_carbon_target_t: 250000
+  target_cost_rs_per_mwh: 4500
+  max_shortfall_prob: 0.02
+  risk_aversion: 0.3
+schedules:
+  maintenance:
+  - asset: W3
+    start: '14:00'
+    hours: 2
+    kind: maintenance
+    flexible_hours: 4
+  conservation:
+  - start: '18:30'
+    end: '20:00'
+    reduction_pct: 5

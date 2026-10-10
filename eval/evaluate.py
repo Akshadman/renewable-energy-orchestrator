@@ -31,9 +31,10 @@ METRICS = {"cost_rs": "Total cost (₹)", "clean_pct": "Clean energy (%)", "curt
 OUT_DIR = ROOT / "eval" / "results"
 
 
-def run_day(seed: int, controller: str, n_events: int = 3, use_llm: bool = False) -> Dict[str, float]:
+def run_day(seed: int, controller: str, n_events: int = 3, use_llm: bool = False,
+            config_path: Optional[str] = None) -> Dict[str, float]:
     """Simulate one randomized day with the given controller and return its totals."""
-    cfg = load_config()
+    cfg = load_config(config_path)
     sim = Simulator(cfg, seed=seed, source="synthetic", use_batteries=controller != "no_battery")
     schedule = random_schedule(np.random.default_rng(10_000 + seed), sim.T, len(cfg.batteries), n_events)
     pending = [Event(e.kind, e.start_tick, e.duration, dict(e.params)) for e in schedule]
@@ -58,11 +59,12 @@ def _job(args: tuple) -> Dict[str, float]:
 
 
 def run_monte_carlo(n: int = 100, seed0: int = 0, n_events: int = 3, use_llm: bool = False,
-                    workers: Optional[int] = None, progress=None) -> pd.DataFrame:
+                    workers: Optional[int] = None, progress=None, config_path: Optional[str] = None,
+                    controllers: Optional[List[str]] = None) -> pd.DataFrame:
     """Run ``n`` days × 3 controllers (same seeds & events for each) and return one row per run."""
     if not use_llm:
         os.environ.pop("ANTHROPIC_API_KEY", None)  # mock reasoner for speed/cost
-    jobs = [(seed0 + i, c, n_events, use_llm) for i in range(n) for c in CONTROLLERS]
+    jobs = [(seed0 + i, c, n_events, use_llm, config_path) for i in range(n) for c in (controllers or CONTROLLERS)]
     workers = workers if workers is not None else (1 if use_llm else min(8, os.cpu_count() or 1))
     rows: List[Dict[str, float]] = []
     if workers <= 1:
@@ -111,10 +113,19 @@ def main() -> None:
     ap.add_argument("--events", type=int, default=3, help="random events per day")
     ap.add_argument("--llm", action="store_true", help="use the LLM reasoner (slow, costs API credits)")
     ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--config", default=None, help="alternative YAML config (e.g. different recipe bands)")
+    ap.add_argument("--agent-only", action="store_true", help="run only the AI (for A/B comparisons)")
+    ap.add_argument("--out", default=None, help="write results CSV here instead of eval/results/")
     a = ap.parse_args()
     df = run_monte_carlo(a.n, a.seed, a.events, a.llm, a.workers,
-                         progress=lambda f: print(f"\r{f:6.1%}", end="", flush=True))
+                         progress=lambda f: print(f"\r{f:6.1%}", end="", flush=True), config_path=a.config,
+                         controllers=["agent"] if a.agent_only else None)
     print()
+    if a.out:
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(a.out, index=False)
+        print(df[list(METRICS)].mean().round(2))
+        return
     paths = save_outputs(df)
     pd.set_option("display.width", 200)
     print(summarize(df)["mean"].round(2))
