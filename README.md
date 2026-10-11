@@ -1,224 +1,210 @@
 # ⚡ Renewable Energy Orchestrator
 
-An **autonomous** AI control room for an industrial renewable energy portfolio. Every 15 minutes, and immediately after any shock, it decides how to run solar farms, wind farms, batteries, flexible loads and the grid connection. The goals are to **minimise cost, maximise clean energy and never cut critical load**. The AI decides, acts and explains within limits set by management; operators can override it at any time, and every action is logged.
+**Team Vaishnav2728Hritika · ET AI Hackathon: Agentic Edition · Claimed position: D3 × F3**
 
-It works for **any industry**. You describe your site (loads, consumption data, generation resources, limits, maintenance and breakdown schedule, carbon and cost targets) in the dashboard, and the AI adapts.
+An autonomous AI control room for an industrial renewable energy portfolio. Every 15 minutes, and immediately after any shock, it decides how to run solar farms, wind farms, batteries, flexible factory loads and the grid connection to **cut cost, maximise clean energy and protect critical load**. It reads **satellite images, thermal inspection images and written notices** alongside live data, tests every candidate plan against **100 possible futures**, acts within limits set by management, and explains every decision in plain English.
 
-> **Core principle:** the AI reasons over *all* signals at once, a MILP optimizer computes the megawatts, a
-> stress test measures risk across 100 possible futures, and a validator enforces physics. An LLM, when
-> enabled, can only choose among plans that already passed those checks. It never produces a number that
-> gets executed.
+| Over 100 randomized days with unannounced storms, breakdowns and price spikes | AI vs business-as-usual |
+|---|---|
+| Energy cost | **−23%** (cheaper on 100 of 100 days) |
+| CO₂ | **−42%** |
+| Critical load cut | **−56%** |
+| Safety violations | **0** (business-as-usual: 4.9 per day) |
+| Wrong findings acted on from images & documents | **0** of 256 applied, from 350 labelled cases |
+
+📄 **Solution deck:** [`deck/Solution_Deck.pdf`](deck/Solution_Deck.pdf)
 
 ---
 
-## Grid position: **D3 × F3**
-
-| Axis | Requirement | Evidence in this repo |
-|---|---|---|
-| **D3** | Highly heterogeneous multimodal input | NASA MODIS satellite images · thermal / drone PV images · PDF work orders & grid notices · free-text fault reports & emails · weather API JSON · price & consumption CSV · config tables (`core/multimodal/`) |
-| **D3** | High degree of demonstrable reliability | `python -m eval.multimodal_eval`: 0 wrong of 256 applied findings, from 350 labelled images and documents; 100% of vague notices quarantined; 0.33 pts mean cloud error on 60 synthetic clouds over 9 real NASA scenes of our sites (a favourable test for a whiteness detector); 0 safety violations over 100 simulated days |
-| **F3** | Simulate the situation over time with varying inputs | 100 sampled futures per decision, 24 h day-ahead plan, full-day digital twin with 11 shocks, 100-day Monte Carlo |
-
-Not claimed: audio input; thermal test images are synthetic with ground truth (no real drone data available), and real drone images without temperature-calibration metadata are analysed but held for operator review until calibrated with the camera's temperature range (by design); plant meters come from a digital twin.
-
-## Multimodal intake (D3)
-- **Satellite** (`core/multimodal/satellite.py`): real NASA GIBS MODIS scene around each solar farm → cloud mask → compared with the forecast at the ~10:30 overpass; a ≥25-point gap derates or uplifts that farm.
-- **Thermal images** (`thermal.py`): per-module median → noise filter → robust threshold → hot-spot modules → capacity derate + a repair job the agent schedules. Noisy / over-exposed images are quarantined.
-- **Documents** (`documents.py`): PDF / TXT work orders, fault reports, SLDC notices, production notices → kind, asset, time window, size (rule parser, or the configured LLM) → validation → confidence.
-- **Gate** (`intake.py`): findings ≥75% confidence are applied to both twins (AI and business-as-usual) and raise alerts the agent re-plans on; the rest are quarantined and shown to operators. Corrupt files are rejected without stopping control.
-- Sample pack: `data/multimodal_samples/` (loaded by default in the dashboard).
-
-## LLM (optional, any provider)
-`agent/llm.py` picks the first key in `.env`: Claude, **Groq (free)**, **Gemini (free)**, OpenRouter, or a local OpenAI-compatible server (Ollama). The LLM receives the full briefing, may **propose its own plan settings** (`propose_plan`), which are optimised and stress-tested like every other plan, then chooses among *eligible* plans and explains. It never outputs megawatts; ineligible choices are rejected in code. The sidebar shows LLM status ON / OFF / FAILED.
-
-## Human oversight
-Operator override switch (hands control to the safe controller instantly) · high-impact actions (load shedding, large exports, moved maintenance) flagged for review · quarantine queue for low-confidence findings · full JSONL audit log.
-
-## Quick start
+## For judges: see it in 5 minutes
 
 ```bash
-cd orchestrator
+git clone https://github.com/Akshadman/renewable-energy-orchestrator.git
+cd renewable-energy-orchestrator
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env            # optional: add ANTHROPIC_API_KEY to let Claude choose & explain
-
-streamlit run app.py            # dashboard (works with no API key and no internet)
-pytest                          # 89 tests (~10 min: several simulate full days)
-python -m eval.multimodal_eval  # D3 reliability on labelled images & documents
-python deck/build_deck.py       # rebuild the solution deck (PDF) from real results
-python -m eval.evaluate --n 100 # Monte Carlo: AI vs business-as-usual vs no-battery
+streamlit run app.py          # opens the dashboard; works with no API key and no internet
 ```
 
-Runs on Python 3.9+. Without an API key (or if the API fails) the optimizer and priority ladder decide on their own, so the demo always runs and is free. API usage is billed separately from a Claude.ai subscription.
+Then, in the dashboard:
+
+1. **⚡ Live control room → ▶ Play.** The AI runs the day on live weather for real farm locations in Rajasthan, Gujarat and Tamil Nadu.
+2. **📥 Evidence from images & documents:** satellite scenes, thermal images and notices it has already read, with what it applied and what it **quarantined** and why.
+3. **🎛️ Make something happen → Storm forecast.** Inject a storm at 10%, then 90%, and compare the plans in **🧠 What the AI is thinking**: the battery reserve rises with the probability.
+4. **Feed a new image or document** (any file from `data/multimodal_samples/`) and watch it re-plan instantly.
+5. **Sidebar → 🛑 Operator override:** a human takes control instantly.
+6. **📊 Results & learning:** the best plan recipe of the day and why it won, savings vs business-as-usual, what the AI learned, and the 100-day proof.
+
+Verify the claims yourself:
+
+```bash
+python -m eval.multimodal_eval      # D3 reliability on 350 labelled images & documents (~1 min)
+pytest                              # 89 automated tests (~10 min; several simulate full days)
+python -m eval.evaluate --n 100     # 100-day comparison vs business-as-usual (~30–60 min)
+```
+
+---
+
+## Our grid position: D3 × F3
+
+| Axis | Requirement | Evidence |
+|---|---|---|
+| **D3** | Highly heterogeneous multimodal input | NASA MODIS satellite images · thermal / drone panel images · PDF work orders and grid-operator notices · free-text fault reports and emails · weather API (JSON) · price and consumption CSV · asset tables |
+| **D3** | High degree of demonstrable reliability | 0 wrong of 256 applied findings, from 350 labelled images and documents · 40 / 40 vague notices quarantined · 0 safety violations in 100 days · validator, repair and safe fallback on every decision |
+| **F3** | Simulate the situation over time, accounting for variations in inputs | Every plan is replayed in 100 sampled futures (forecast spread + alert probabilities) · 24-hour day-ahead plan · full-day digital twin with 11 shock types · 100-day Monte Carlo |
+
+F1 (optimal set of actions) and F2 (situation-specific criteria under uncertainty) are covered along the way; see the deck.
+
+**What we deliberately do not claim**
+- No audio / voice input.
+- Thermal test images are **synthetic with known ground truth**, because no real drone data was available. Satellite scenes, weather data and document formats are real. A real drone image without temperature-calibration metadata is analysed but **held for operator review** until calibrated with the camera's temperature range, by design.
+- Plant meters come from a physics-based **digital twin**; the same interface accepts live SCADA data.
+- The price file `data/iex_prices.csv` is a **labelled sample** in IEX 15-minute format.
+
+---
+
+## Where each judging criterion is evidenced
+
+| Criterion | Where to look |
+|---|---|
+| **Significance & relevance** | Indian industrial renewable portfolios re-planned every 15 min; default site = 5 solar, 3 wind, 2 batteries, 4 industrial loads |
+| **Innovation & originality** | Plan recipes as **parameter ranges** searched every tick; risk handled as **probabilities** across 100 futures, not fixed "situations"; multimodal evidence gated by confidence |
+| **Effective use of AI** | Computer vision (cloud masks, hot-spot detection), document understanding, MILP optimisation, Monte Carlo simulation, online learning, and an LLM agent that can **propose and test its own plan** |
+| **Technical complexity** | `agent/`, `core/` · 89 tests · reproducible evaluations in `eval/` |
+| **Agentic / autonomous capability** | Perceives → diagnoses → plans → simulates → chooses → verifies → acts → explains → learns; sends repair crews and reschedules maintenance itself; recovers from solver, data and LLM failures |
+| **Business impact** | −23% cost, −42% CO₂, −56% critical load cut over 100 days; live "money saved" vs a business-as-usual twin |
+| **Prototype quality** | Streamlit control room with 3 tabs; runs offline with no key |
+| **Scalability, responsible AI, robustness** | Any industry via configuration · LLM never outputs megawatts · physics validator · confidence gate · operator override · full audit log |
+
+---
 
 ## How the AI decides
 
-There are no situation "cases" and no fixed playbook. Every tick runs one pass in which nothing is thrown away:
-
 ```mermaid
 flowchart LR
-    subgraph IN["Inputs (from your industry + live data)"]
-        D[Real-time demand<br/>& consumption data]
-        R[Resources, capacities<br/>& limits]
-        M[Maintenance &<br/>breakdown schedule]
-        T[Carbon & cost targets,<br/>risk tolerance]
-        W[Weather: live → last-year proxy<br/>→ saved day → simulated]
-        P[Prices: IEX 15-min]
-    end
-    IN --> PER[PERCEIVE<br/>state + learned P10/P50/P90<br/>forecasts + alerts with probabilities]
-    PER --> DIA[DIAGNOSE<br/>9 continuous signals,<br/>all measured together]
-    DIA --> OPT[OPTIONS<br/>search inside 9 recipe bands:<br/>explore 27 → refine 6 combinations]
-    OPT --> ST[STRESS-TEST<br/>each plan × 100 futures<br/>avg ₹ · worst ₹ · P shortfall]
-    ST --> CH[CHOOSE<br/>priority ladder<br/>± Claude among eligible]
-    CH --> VER{VERIFY<br/>physics validator}
-    VER -->|fail| REP[repair: relax ×2] --> FB[safe fallback]
-    VER -->|pass| ACT[ACT autonomously<br/>+ explain + log]
+    IN[Inputs: industry setup · weather · prices<br/>satellite & thermal images · PDF / text notices] --> MM[Multimodal intake<br/>extract → validate → confidence gate]
+    MM --> PER[Perceive<br/>state, learned P10/P50/P90 forecasts,<br/>alerts with probabilities]
+    PER --> DIA[Diagnose<br/>9 risk signals at once]
+    DIA --> OPT[Options<br/>33 plans from 9 recipe ranges<br/>MILP optimiser]
+    OPT --> ST[Stress-test<br/>each plan × 100 futures]
+    ST --> CH[Choose<br/>priority ladder ± LLM critique]
+    CH --> VER{Verify<br/>physics validator}
+    VER -->|fail| FB[Repair → safe fallback]
+    VER -->|pass| ACT[Act · explain · audit log]
     FB --> ACT
-    ACT --> OUT[Outputs: actions log, energy produced,<br/>money & CO₂ saved, efficiency, clean %]
-    ACT --> LRN[LEARN<br/>forecast bias & band width,<br/>saved for tomorrow]
+    ACT --> LRN[Learn<br/>forecast bias, saved daily]
     LRN -.-> PER
-    DA[Day-ahead 24 h plan<br/>re-based after shocks] -.battery target.-> OPT
+    OV[Operator override] -.-> ACT
 ```
 
-1. **Perceive:** current state, forecasts already corrected by what the AI has learned, prices, and alerts that carry a **probability** (e.g. "storm 35% likely in 90 min").
-2. **Diagnose:** nine continuous signals, measured together: storm probability, price vs normal, grid-line headroom, batteries in service, generation offline, demand surprise, renewable shortfall, battery charge, CO₂ budget pace. A storm and a price spike at the same time are both kept and both affect the decision.
-3. **Options, as recipe bands.** A recipe isn't one fixed setting but a **range for every parameter**:
+1. **Perceive:** plant state, forecasts already corrected by what the AI has learned, prices, and alerts that carry a probability (e.g. "storm 35% likely in 90 min").
+2. **Diagnose:** nine signals measured **together**: storm probability, price vs normal, grid-line headroom, batteries in service, generation offline, demand surprise, renewable shortfall, battery charge and CO₂ budget pace. Nothing is reduced to a single "situation".
+3. **Options:** nine plan recipes (Max savings, Lean, Balanced, Green-lean, Steady, Cautious, Protective, Strong reserve, Fortress). Each is a **range** for battery reserve, price/clean/reliability weights and forecast caution. The AI tries 3 combinations inside every range, then 6 more around the best (**33 plans**). The optimiser turns each into exact megawatt set-points for the next 4 hours.
+4. **Stress-test:** each plan is replayed in **100 sampled futures**. A 35% storm hits in about 35 of them. Output: average cost, worst-case cost, probability of cutting critical load, CO₂, battery wear.
+5. **Choose with a priority ladder:**
+   1. physically safe
+   2. risk of cutting critical load ≤ the industry's tolerance (default 2%)
+   3. best cost-vs-clean score, weighted by the carbon target and worst-case aversion
+   4. least battery wear
 
-   | Recipe | Battery reserve | Price sensitivity | Clean weight | Reliability weight | Forecast caution | Demand-response use |
-   |---|---|---|---|---|---|---|
-   | Max savings | 5–15% | 58–72% | 15–25% | 8–22% | 0–15% | 100% |
-   | Lean | 12–25% | 52–66% | 14–24% | 15–29% | 0–25% | 100% |
-   | Balanced | 22–35% | 46–60% | 13–23% | 23–37% | 10–35% | 100% |
-   | Green-lean | 20–40% | 23–37% | 48–62% | 10–20% | 0–25% | 100% |
-   | Steady | 32–45% | 39–53% | 11–21% | 31–45% | 20–50% | 100% |
-   | Cautious | 42–55% | 32–46% | 10–20% | 39–53% | 35–65% | 100% |
-   | Protective | 52–68% | 25–39% | 8–18% | 48–62% | 50–80% | 100% |
-   | Strong reserve | 64–80% | 17–31% | 7–17% | 58–72% | 65–95% | 100% |
-   | Fortress | 76–90% | 9–23% | 5–15% | 66–80% | 80–100% | 100% |
+   An LLM, if configured, may challenge the pick by **proposing its own plan**, which is tested exactly like the others, and then chooses among the eligible plans with a written rationale.
+6. **Verify → act → explain:** validated again; if nothing passes, constraints are relaxed, and as a last resort a safe rule-based controller acts. Every decision is logged with all 33 plans and their scores.
+7. **Learn:** every 1-hour-ahead forecast is compared with what happened, and bias and uncertainty bands are corrected and saved for the next day.
 
-   *Demand-response use* is kept at 100% by default: an A/B test showed that letting the AI restrict it raised cost by ₹2.6 L/day. It stays editable as a contractual cap.
-
-   The 9 recipes are the same ones as before (Max savings … Fortress), each now a range centred on its old setting and slightly overlapping its neighbours. Every decision, the AI **explores** 3 combinations per band (27 total), then **refines** with 6 more around the best one (33 combinations, under a second). Each combination becomes an exact MW plan via the MILP optimizer, aimed at the **day-ahead plan's** battery trajectory (re-solved after every shock). *Forecast caution* blends smoothly from expected (P50) to pessimistic (P10 renewables / P90 demand). Bands are set in `config/assets.yaml` (`agent.recipes`).
-4. **Stress-test:** each combination is replayed in 100 sampled futures. Futures are drawn from the forecast uncertainty and from each alert's probability, so a 35% storm hits in about 35 of them. The result is average cost, worst-case (P95) cost, the **probability of cutting critical load**, CO₂, curtailment and battery wear.
-5. **Choose, using a priority ladder with thresholds:**
-   1. *Safety:* the plan must pass the physics validator.
-   2. *Reliability:* shortfall risk must be within **your** tolerance (default 2%).
-   3. *Cost vs clean:* best score = avg cost + risk aversion × (worst − avg) + carbon-pressure × (CO₂ + curtailment value).
-   4. *Battery life:* among near-equal plans, pick the one with the least wear.
-
-   With an API key, Claude sees the whole briefing and may pick a different **eligible** plan, with its reasoning. Anything else is rejected by code.
-6. **Verify → act → explain:** validate again; if nothing is valid, repair (allow controlled flexible-load reduction), then fall back to the safe controller. Then execute and write a 2–3 sentence explanation, e.g. *"I tested 33 combinations from 9 recipe bands across 100 futures and chose a 'Protective' plan (≥67% reserve)… 'Max savings' would save ₹84,597 but risks a critical shortfall in 54% of futures (limit 2%)."*
-7. **Learn:** compare every 1-hour-ahead forecast with what happened, learn each resource's bias and how wide the P10–P90 band should be, apply that immediately, and save it to `data/learning.json` for the next day.
-
-**Operations, also autonomous:** maintenance jobs that may move are shifted into the slot that loses the least energy × price. Breakdowns get an inspection crew immediately, which shortens the outage.
-
-### Why probability matters
-
-The chosen protection depends on *how likely* a risk is, through the stress test rather than a rule. Measured on one simulated day with a storm forecast at 18:00 (`tests/test_agent.py::test_protection_rises_with_storm_probability`):
+**Protection scales with probability** (same day, storm forecast at 18:00):
 
 | Storm probability | 0% | 10% | 50% | 90% |
 |---|---|---|---|---|
-| Chosen recipe | Balanced | Steady | Protective | Protective |
-| Battery reserve chosen | 27% | 43% | 52% | 60% |
+| Battery reserve the AI keeps | 27% | 43% | 52% | 60% |
 
-Because the AI searches *inside* the recipe bands, protection rises smoothly with the risk instead of jumping between a few fixed plans.
+---
 
-When a storm would threaten **critical** load (e.g. batteries nearly empty at dawn), any probability above your tolerance triggers protection, because that is what "2% acceptable risk" means. Raise the tolerance slider and the AI accepts more risk for lower cost.
+## Multimodal intake (D3)
 
-## Your industry: inputs the dashboard accepts
+| Modality | How it is understood | What it changes |
+|---|---|---|
+| 🛰️ **Satellite** (`core/multimodal/satellite.py`) | Real NASA MODIS scene around each solar farm → cloud mask → compared with the forecast at the ~10:30 overpass | A gap of ≥25 points derates or uplifts that farm's solar |
+| 🌡️ **Thermal / drone images** (`thermal.py`) | Per-module median → noise filter → robust threshold → hot-spot modules | Farm capacity derated; repair job scheduled by the AI |
+| 📄 **PDF / text notices** (`documents.py`) | Classify → extract asset, time window and size (rule parser, or the configured LLM) → validate | Maintenance request, outage, grid-line limit or demand change |
+| **Gate** (`intake.py`) | Confidence ≥75% → applied to the plant and the AI re-plans; otherwise **quarantined** for a human | Corrupt or unsupported files are rejected without stopping control |
 
-| Input (Setup tab) | Used for |
+**Reliability on labelled data** (`python -m eval.multimodal_eval`):
+
+| Test | Result |
 |---|---|
-| Loads: typical MW, critical %, demand-response eligibility, daily shape | Demand model; critical load is never cut voluntarily |
-| Utility consumption CSV (one column per load) | Replaces the demand shape with your real data (any time step, resampled to 15 min) |
-| Solar / wind farms with lat-lon and capacity; batteries | Weather → MW via standard power curves; dispatch |
-| Grid import / export limits | Hard constraints (live-derated by congestion and storms) |
-| Maintenance & breakdown schedule | Breakdowns fixed; maintenance with "± hours" is moved by the AI |
-| Annual CO₂ target, target ₹/MWh, risk tolerance, worst-case aversion | Ladder thresholds and scoring |
+| Thermal images, easy / medium (50 + 50) | 100% exact defect count · 96 applied · **0 wrong** |
+| Thermal images, hard: heavy noise + glare (50) | All held back (detection unreliable) · **0 applied** |
+| Documents: 160 clear + 40 vague notices, many formats | 160 / 160 applied correctly · 40 / 40 quarantined · **0 wrong** |
+| Satellite cloud detector | 0.33-point mean error on 60 synthetic clouds over 9 real NASA scenes of our sites (a favourable test for a whiteness detector) |
 
-Profiles can be saved and loaded (`config/profiles/*.yaml`). The default is a Rajasthan / Gujarat / Tamil Nadu portfolio (`config/assets.yaml`).
+---
 
-## Data sources
-- **Live:** Open-Meteo `minutely_15` (shortwave radiation, 100 m wind, cloud cover, weather code), one request for all sites and cached.
-- **Proxy:** the same calendar day **one year earlier** from the Open-Meteo archive (hourly, interpolated to 15 min). Used automatically if live fails.
-- **Replay:** saved real days in `data/replay/`. **Synthetic:** statistical weather.
-- **Fallback chain:** Live → Last year → Replay → Synthetic. The sidebar shows the active source and why.
-- **Storm alerts** come from WMO codes 95/96/99/65/67/82 or hub-height wind ≥ 20 m/s, with a probability that decays with lead time.
-- **Prices:** `data/iex_prices.csv` in IEX 15-minute block format. ⚠️ The shipped file is a **generated sample** (labelled in its first line); replace it with a real IEX export.
+## Results: 100-day Monte Carlo
 
-## Dashboard
-1. **🏭 Your industry:** all the inputs above, with validation, *Apply & start day* and *Save as profile*.
-2. **⚡ Live control room:**
-   - **Status line:** e.g. "🟠 18:00 — Storm risk 35% in 90 min · Price 2.1× normal → AI decision: Protective".
-   - **Output cards:** energy produced, money saved, carbon saved, clean %, generation efficiency, load cut / violations. Savings are measured against a business-as-usual twin running the same day with the same shocks.
-   - **Charts:** where the power came from, battery charge vs the AI's chosen reserve, price, grid flow vs line limits.
-   - **What the AI is thinking:** all signals as bars, the diagnosis, the decision and its explanation, and a table of every plan considered with its stress-test numbers and why it won or lost.
-   - **Make something happen:** inject any of 11 events with parameters (storm probability and arrival, which farm breaks, how bad). The AI re-plans immediately.
-3. **📊 Results & learning:** today's AI vs business-as-usual, **the best recipe of the day and why it was chosen** (hours in control, timeline, typical settings, conditions, winning margin, and a step-by-step walkthrough of the latest decision through the priority ladder), clean vs traditional energy, what the AI has learned (error before and after), and the Monte Carlo proof.
-
-## Results
-
-100 randomized synthetic days, 3 unannounced shocks per day (storms with random probabilities, breakdowns,
-price spikes, congestion, …), offline mode. All controllers see identical weather, demand, prices and shocks.
-Reproduce with `python -m eval.evaluate --n 100`. 
+100 randomized days, 3 unannounced shocks per day (storms with random probabilities, breakdowns, price spikes, congestion, …). All controllers see identical weather, demand, prices and shocks. Results are from offline mode (optimiser + ladder, no LLM).
 
 | Mean per day | **AI** | Business-as-usual | No battery |
 |---|---:|---:|---:|
-| Cost (₹ lakh) | **72.4** (-23%) | 94.2 | 101.2 |
-| Clean energy | **72.4 %** | 61.6 % | 57.4 % |
+| Cost (₹ lakh) | **72.4** (−23%) | 94.2 | 101.2 |
+| Clean energy | **72.4%** | 61.6% | 57.4% |
 | Curtailment (MWh) | **9.8** | 22.3 | 44.0 |
-| Critical load cut (MWh) | **5.3** (-56%) | 12.1 | 13.5 |
-| All load cut incl. flexible (MWh) | **5.4** (-82%) | 30.1 | 32.8 |
-| Safety violations | **0.00** (max 0) | 4.87 | 3.60 |
-| CO₂ (t) | **557** (-42%) | 957 | 1062 |
+| Critical load cut (MWh) | **5.3** (−56%) | 12.1 | 13.5 |
+| All load cut incl. flexible (MWh) | **5.4** (−82%) | 30.1 | 32.8 |
+| Safety violations | **0.00** | 4.87 | 3.60 |
+| CO₂ (t) | **557** (−42%) | 957 | 1062 |
 
-- **Cost:** the AI was cheaper on **100 of 100** days.
-- **Critical load cut:** the AI had some on 8 of 100 days, vs 20 for business-as-usual. These are physical shortages that no plan can cover, e.g. a storm hitting while the line is congested. The AI then protects critical load first and says so.
-- **Design comparison (A/B, same 100 days):**
+- We lead with **critical** load (−56%) rather than total load (−82%): almost all of the AI's remaining cuts are physical shortages no plan can cover (e.g. a storm while the grid line is congested), where it protects critical load first and says so.
+- The AI cut some critical load on 8 of 100 days, vs 20 for business-as-usual.
+- **Safety violations** = executed commands that broke a physical limit (battery charge, power rating, line limit, unavailable asset).
 
-  | AI version | Cost / day | Cheaper than 9 fixed plans on |
-  |---|---:|---:|
-  | 9 fixed plans | ₹72.07 L | — |
-  | 5 recipe bands | ₹71.97 L | 59 / 100 days |
-  | **9 recipe bands (current)** | **₹71.91 L** | 56 / 100 days |
-  | 5 bands that could also restrict demand response | ₹74.67 L | 2 / 100 days |
+---
 
-  The band designs are slightly cheaper than fixed plans (about ₹6–16k/day, close to the noise level); their main benefit is the smooth response to risk. Letting the AI restrict demand response was clearly worse, so it defaults to 100%. Configs and results: `eval/ab/`.
-- **"Safety violations"** are executed commands that broke a physical limit (SoC, rate, line, unavailable asset). Load cut is reported separately.
+## Responsible AI and human oversight
 
-## Blocker → evidence
+- **No hallucinated actions:** the LLM can only propose plan *settings* or pick a validated plan id; all megawatts come from the optimiser, and ineligible picks are rejected in code.
+- **Physics guardrails:** every action is validated before execution; the digital twin independently counts violations.
+- **Confidence gate:** image and document findings below 75% confidence are quarantined for a human.
+- **Human oversight:** an **operator override** hands control to a safe controller instantly; high-impact actions (load shedding, large exports, moved maintenance) are flagged for review; management sets risk tolerance, targets and recipe ranges.
+- **Audit:** every decision is logged to `logs/decisions.jsonl` (signals, evidence, all 33 plans, stress results, choice, action, explanation) and is reproducible with seeded scenarios.
+- **Fault tolerance:** weather falls back live → same day last year → saved day → simulated; the solver repairs or falls back; LLM failures leave the optimiser in charge, shown as **LLM: FAILED** in the sidebar.
+- **Privacy & security:** no personal data; API keys only in `.env`; a real plant would be connected read-only first, in shadow mode.
 
-| # | Blocker | How it's handled | Evidence |
-|---|---|---|---|
-| 1 | LLM hallucinates numbers | The LLM can only pick a plan id among validated, stress-tested plans; MW come from the MILP | `agent/tools.py`, `test_llm_cannot_choose_ineligible_plan` |
-| 2 | Physically unsafe actions | Validator before every execution; simulator independently clips and counts violations | `core/validator.py`, `tests/test_guards.py`, Monte Carlo violations |
-| 3 | Rigid "case" logic | 9 continuous signals together; plans scored against probability-weighted futures | `test_all_signals_kept_together`, `test_protection_rises_with_storm_probability` |
-| 4 | Solver infeasibility / physical shortage | Clear status → relax ×2 → safe fallback, with a plain explanation | `test_infeasible_handled_without_crash`, `test_portfolio_without_wind_or_batteries_runs` |
-| 5 | LLM outage / no key | Optimizer + ladder decide alone; every decision records who decided | `test_llm_outage_keeps_running`, `test_full_autonomous_day` |
-| 6 | Data-source outage | Live → last-year proxy → replay → synthetic, cached, shown in UI | `tests/test_data_sources.py` (mocked HTTP) |
-| 7 | Asset breakdowns & maintenance | Outages modelled per asset; crews dispatched; flexible maintenance moved autonomously | `test_breakdown_triggers_autonomous_crew`, `test_maintenance_moved_without_approval` |
-| 8 | Not industry-agnostic | Any loads/assets/targets via Setup tab or YAML profile; custom consumption data | `tests/test_industry.py` |
-| 9 | Doesn't improve | Online forecast-bias & calibration learning, persisted daily | `test_learning_reduces_forecast_error`, `test_learning_persists_between_days` |
-| 10 | Unproven value | 100-day Monte Carlo vs two baselines + live savings vs a twin | `eval/results/`, `test_operation_measures_savings_vs_baseline` |
+---
 
-## Code map
+## Optional: enable an LLM (free options available)
+
+Without a key, the optimiser and priority ladder decide on their own. To add an LLM, copy `.env.example` to `.env` and set **one** key: `GROQ_API_KEY` (free tier), `GEMINI_API_KEY` (free tier), `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or `LLM_BASE_URL` for a local model (e.g. Ollama). The sidebar shows **LLM: ON / OFF / FAILED**.
+
+---
+
+## Repository map
 
 | Path | What it does |
 |---|---|
-| `agent/agent.py` | The autonomous loop (perceive → … → learn), priority ladder, repair, operations |
-| `agent/recipes.py` | Recipe bands, explore / refine search |
-| `agent/signals.py` | DIAGNOSE: continuous signals and human-readable headline |
-| `agent/stress_test.py` | Future sampling (forecast quantiles + storm probabilities) and plan replay |
-| `agent/narrator.py`, `prompts.py`, `tools.py` | Offline explanations; LLM prompt and the single `submit_decision` tool |
-| `agent/runner.py` | AI twin + business-as-usual twin in lockstep, headline outputs |
-| `core/optimizer.py` | Rolling-horizon MILP (PuLP/CBC); LP mode for the day-ahead plan |
+| `app.py` | Streamlit dashboard (setup · live control room · results & learning) |
+| `agent/agent.py` | The autonomous loop, priority ladder, repair, operator override, operations |
+| `agent/recipes.py` · `signals.py` · `stress_test.py` | Recipe ranges & search · risk signals · 100-future stress test |
+| `agent/llm.py` · `prompts.py` · `tools.py` | Provider-neutral LLM client · prompt · `propose_plan` and `submit_decision` tools |
+| `agent/runner.py` | AI twin + business-as-usual twin in lockstep, multimodal intake, outputs |
+| `core/multimodal/` | Satellite, thermal, document understanding and the confidence gate |
+| `core/optimizer.py` | Rolling-horizon MILP (PuLP / CBC) |
+| `core/simulator.py` · `events.py` · `data_sources.py` | Digital twin, 11 shock types, weather and price sources |
 | `core/learning.py` | Online forecast-bias and band-width learning |
-| `core/simulator.py`, `events.py` | Digital twin, outages/maintenance, hidden storm outcomes, 11 shocks |
-| `core/data_sources.py` | Live / last-year / replay / synthetic weather, IEX prices, storm alerts |
-| `core/config.py` | Industry profiles: load, validate, save |
+| `eval/` | 100-day Monte Carlo, multimodal reliability evaluation, A/B design tests |
+| `deck/` | Solution deck (PDF / HTML) and the script that builds it from the results |
+| `tests/` | 89 automated tests |
 
-## Limitations
-- Single-bus model; frequency is a proportional proxy of imbalance.
-- Demand comes from shapes or your uploaded data; prices are a labelled sample until a real IEX file is added.
-- Forecasts are simulated (future truth + bias + noise), not a trained weather model; learning corrects bias and calibration only.
-- The band search samples 33 combinations per decision. It finds very good combinations, but not a mathematically proven optimum (that would need full stochastic optimisation).
+Runs on Python 3.9+. Default site: `config/assets.yaml` (Rajasthan / Gujarat / Tamil Nadu portfolio).
+
+---
+
+## Limitations and roadmap
+
+| Today | Next |
+|---|---|
+| Thermal test images are synthetic; no audio input | Real drone datasets; field-crew voice notes through the same document pipeline |
+| Plant data from a digital twin | Live SCADA / meter / battery adapter with data-health monitoring |
+| Sample IEX prices | Real IEX day-ahead and real-time prices with deviation penalties |
+| Results measured without the LLM | A/B test of the LLM layer over 100 days with a free-tier model |
+| 33-plan search finds very good plans, not a proven optimum | Full stochastic optimisation |
+| Single-bus electrical model | Network constraints inside the plant |
