@@ -6,11 +6,15 @@ The baseline (naive rule-based controller) sees identical weather, demand, price
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.agent import OrchestratorAgent
 from core.baseline import NaiveController
+from core.config import resolve_path
 from core.models import TICK_HOURS, Config, Event
+from core.multimodal import intake, satellite
+from core.multimodal.evidence import Evidence
 from core.simulator import Simulator
 
 
@@ -25,6 +29,35 @@ class Operation:
         self.agent = OrchestratorAgent(sim, cfg, use_llm=use_llm, persist_learning=persist_learning, **kw)
         self.base_sim = Simulator(cfg, seed=sim.seed, weather=copy.deepcopy(sim.weather), day=sim.day)
         self.baseline = NaiveController(cfg)
+        self.evidence: List[Evidence] = []
+
+    # ------------------------------------------------------------ multimodal intake
+    def ingest(self, files: List[Tuple[str, bytes]]) -> List[Evidence]:
+        """Analyse images / documents now and apply accepted findings to both twins."""
+        llm = self.agent.llm.client if self.agent.llm else None
+        found = intake.process(files, self.cfg, self.sim.tick, llm)
+        return self._accept(found)
+
+    def check_satellite(self) -> List[Evidence]:
+        """Real NASA satellite scenes for every solar farm vs the weather forecast."""
+        found = satellite.analyse_sites(self.cfg, self.sim.weather, self.sim.day,
+                                        resolve_path(self.cfg.data.get("cache_dir", "data/cache")) / "satellite")
+        return self._accept(found)
+
+    def _accept(self, found: List[Evidence]) -> List[Evidence]:
+        intake.apply_all(found, [self.sim, self.base_sim], self.sim.tick)
+        self.evidence.extend(found)
+        self.agent.evidence_notes = [f"[{e.modality}] {e.summary} (confidence {e.confidence:.0%})"
+                                     for e in self.evidence if e.status == "applied"][-12:]
+        return found
+
+    @property
+    def override(self) -> bool:
+        return self.agent.operator_override
+
+    @override.setter
+    def override(self, on: bool) -> None:
+        self.agent.operator_override = bool(on)
 
     @property
     def done(self) -> bool:

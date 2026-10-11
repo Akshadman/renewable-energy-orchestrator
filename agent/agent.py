@@ -20,7 +20,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -29,7 +29,8 @@ from agent.prompts import SYSTEM_PROMPT, tick_brief
 from agent.recipes import PARAMS, Recipe, explore, load_recipes, refine, to_criteria
 from agent.signals import Signals, diagnose
 from agent.stress_test import StressResult, sample_futures, stress_test
-from agent.tools import SUBMIT_DECISION, build_briefing
+from agent.llm import LLMClient, from_env
+from agent.tools import TOOL_SCHEMAS, build_briefing
 from core.config import ROOT, resolve_path
 from core.fallback import safe_action
 from core.forecaster import Forecaster
@@ -107,25 +108,35 @@ class Decision:
 
 # ---------------------------------------------------------------- LLM
 class LLMReasoner:
-    """Claude picks among eligible, stress-tested plans and explains (one forced tool call)."""
+    """An LLM (Claude, Groq, Gemini …) critiques the ladder's pick, may propose and test its own plan, then
+    chooses among eligible plans and explains."""
 
     name = "llm"
 
-    def __init__(self, api_key: str, model: Optional[str] = None) -> None:
-        import anthropic
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = model or os.environ.get("LLM_MODEL") or DEFAULT_MODEL
+    def __init__(self, client: LLMClient) -> None:
+        self.client = client
 
-    def decide(self, briefing: str) -> Dict[str, str]:
-        """Return {'option_id', 'diagnosis', 'explanation'}."""
-        resp = self.client.messages.create(
-            model=self.model, max_tokens=700, system=SYSTEM_PROMPT, tools=[SUBMIT_DECISION],
-            tool_choice={"type": "tool", "name": "submit_decision"},
-            messages=[{"role": "user", "content": tick_brief(briefing)}])
-        for block in resp.content:
-            if getattr(block, "type", "") == "tool_use" and block.name == "submit_decision":
-                return dict(block.input)
-        raise ValueError("model did not call submit_decision")
+    @property
+    def label(self) -> str:
+        return self.client.label
+
+    def decide(self, briefing: str, propose: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
+        """Return {'option_id', 'diagnosis', 'explanation'} (+ 'proposals' made)."""
+        proposals: List[Dict[str, Any]] = []
+
+        def handler(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+            if name != "propose_plan":
+                return {"error": f"unknown tool {name}"}
+            if len(proposals) >= 2:
+                return {"error": "proposal limit reached — decide now"}
+            out = propose(args)
+            proposals.append({"args": args, "result": out})
+            return out
+
+        pick = self.client.run_tools(SYSTEM_PROMPT, tick_brief(briefing), TOOL_SCHEMAS, handler, "submit_decision",
+                                     max_turns=4)
+        pick["proposals"] = proposals
+        return pick
 
 
 # ---------------------------------------------------------------- agent
@@ -152,12 +163,18 @@ class OrchestratorAgent:
         self.log_path = Path(log_path) if log_path else None
         self.llm: Optional[LLMReasoner] = llm
         self.llm_error = ""
-        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-        if self.llm is None and use_llm is not False and key:
+        if self.llm is None and use_llm is not False:
             try:
-                self.llm = LLMReasoner(key)
+                client = from_env()
+                self.llm = LLMReasoner(client) if client else None
             except Exception as exc:  # SDK missing/misconfigured → offline mode
                 self.llm_error = f"LLM unavailable: {exc}"
+        self.llm_status: Dict[str, Any] = {"provider": self.llm.label if self.llm else None,
+                                           "state": "configured" if self.llm else "off", "calls": 0, "ok": 0,
+                                           "proposals": 0, "proposals_won": 0, "last_error": self.llm_error}
+        self.operator_override = False          # operator can hand control to the safe controller at any time
+        self.high_impact: List[Dict[str, Any]] = []
+        self.evidence_notes: List[str] = []     # multimodal findings currently in force (set by Operation)
         self.ref_price = float(np.median(sim.profile.mcp)) + config.market.buy_adder
         self.decisions: List[Decision] = []
         self.current_forecast: Optional[Forecast] = None
@@ -195,6 +212,8 @@ class OrchestratorAgent:
         # DIAGNOSE
         sig = self.current_signals = self._diagnose(st, fc, alerts)
         headline = sig.headline()
+        if self.operator_override:
+            return self._override_step(st, sig, headline, trigger)
         # OPTIONS + STRESS-TEST
         futures = sample_futures(st, fc, cfg, sig.storms, self.n_futures, seed=sim.seed * 7919 + st.tick)
         target = self._da_soc.get(st.tick + H - 1)
@@ -210,23 +229,50 @@ class OrchestratorAgent:
         chosen, eligible = self._ladder(options, sig)
         reasoner, llm_error, diag, expl = "offline", "", diagnosis_text(headline), ""
         if chosen is not None and self.llm and eligible and self._should_consult(trigger, headline, st.tick):
+            self.llm_status["calls"] += 1
+
+            def propose(args: Dict[str, Any]) -> Dict[str, Any]:
+                pt = {"reserve_pct": float(np.clip(args.get("reserve_pct", 0.3), 0, 0.9)),
+                      "w_cost": float(np.clip(args.get("w_cost", 0.4), 0, 1)),
+                      "w_clean": float(np.clip(args.get("w_clean", 0.3), 0, 1)),
+                      "w_reliability": float(np.clip(args.get("w_reliability", 0.3), 0, 1)),
+                      "caution": float(np.clip(args.get("caution", 0.3), 0, 1)), "max_dr_frac": 1.0}
+                llm_recipe = Recipe("LLM proposal", {p: (0.0, 0.9 if p == "reserve_pct" else 1.0) for p in PARAMS})
+                options.extend(self._evaluate([(llm_recipe, pt)], "llm", st, fc, futures, target, sig, options))
+                rec, _ = self._ladder(options, sig)
+                mine = options[-1]
+                self.llm_status["proposals"] += 1
+                return {"option_id": mine.id, "status": mine.status, "reason": mine.reason,
+                        "row": {k: mine.row()[k] for k in ("cost_avg_rs", "cost_p95_rs", "p_shortfall", "co2_t",
+                                                           "battery_wear_mwh", "score")},
+                        "ladder_now_recommends": rec.id if rec else None}
+
             try:
                 pick = self.llm.decide(build_briefing(clock(st.tick), sig.to_dict(), [t for t, _ in headline],
                                                       [o.row() for o in options], chosen.id,
-                                                      [o.id for o in eligible], cfg.targets))
+                                                      [o.id for o in eligible], cfg.targets, self.evidence_notes),
+                                       propose)
                 self._last_llm_tick = st.tick
-                reasoner = "llm"
+                self.llm_status.update(state="on", last_error="")
+                self.llm_status["ok"] += 1
+                reasoner = f"llm ({self.llm.label})"
                 diag, expl = pick.get("diagnosis") or diag, pick.get("explanation", "")
+                chosen, eligible = self._ladder(options, sig)        # re-rank incl. any LLM proposals
                 by_id = {o.id: o for o in eligible}
                 if pick.get("option_id") in by_id:
                     if pick["option_id"] != chosen.id:
-                        self._notes.append(f"LLM overrode ladder pick {chosen.id} → {pick['option_id']}")
+                        self._notes.append(f"LLM chose {pick['option_id']} over ladder pick {chosen.id}")
                     chosen = by_id[pick["option_id"]]
+                    if chosen.stage == "llm":
+                        self.llm_status["proposals_won"] += 1
+                        self._notes.append(f"LLM's own proposed plan {chosen.id} was selected")
                 else:
                     llm_error = f"LLM picked non-eligible '{pick.get('option_id')}', kept {chosen.id}"
                     expl = ""
             except Exception as exc:  # API outage etc. → ladder pick stands
                 llm_error = f"{type(exc).__name__}: {exc}"[:300]
+                self.llm_status.update(state="error", last_error=llm_error)
+                chosen, eligible = self._ladder(options, sig)
         # VERIFY → repair → fallback
         action, source, crit = (chosen.action, "optimizer", chosen.criteria) if chosen else self._repair(st, fc, options)
         vr = validate(action, st, cfg)
@@ -384,6 +430,9 @@ class OrchestratorAgent:
                 sim.schedule_maintenance(m.id, start)
                 moved = "" if start == m.requested_start else f" (moved from {clock(m.requested_start)})"
                 self._notes.append(f"Scheduled maintenance {m.id} on {m.asset_id} at {clock(start)}{moved}")
+                if moved:
+                    self.high_impact.append({"time": clock(sim.tick), "tick": sim.tick, "acknowledged": False,
+                                             "action": f"Moved maintenance {m.id} on {m.asset_id} to {clock(start)}"})
         for o in sim.outages:
             key = (o["asset"], o["start"])
             if o["cause"] == "breakdown" and o["start"] <= sim.tick < o["end"] and key not in self._inspected:
@@ -409,11 +458,36 @@ class OrchestratorAgent:
                 best, best_cost = s, cost
         return best
 
+    def _override_step(self, st: GridState, sig: Signals, headline: list, trigger: str) -> Decision:
+        """Operator override: the safe rule-based controller acts; the AI's planning is suspended."""
+        action = safe_action(st, self.cfg, reserve_pct=0.2)
+        vr = validate(action, st, self.cfg)
+        kpi = self.sim.step(action)
+        summary = describe_action(action)
+        self._notes.append("OPERATOR OVERRIDE active — AI planning suspended, safe controller in charge")
+        d = Decision(tick=st.tick, hour=st.hour, time=clock(st.tick), trigger=trigger, signals=sig.to_dict(),
+                     headline=[list(h) for h in headline], diagnosis=diagnosis_text(headline), options=[],
+                     chosen="override", chosen_name="Operator override", criteria=Criteria().to_dict(),
+                     plan_source="operator override", reasoner="operator", validation=vr.to_dict(),
+                     action=action.to_dict(), action_summary=summary, notes=self._notes,
+                     explanation=f"Operator override is active, so the safe rule-based controller ran this tick and "
+                                 f"{_summarize(summary)}.", kpi=kpi.to_dict())
+        self.decisions.append(d)
+        self._log(d)
+        return d
+
     def _flag_high_impact(self, a: Action, st: GridState) -> None:
+        """Note and log actions an operator should be able to review."""
+        items = []
         if a.shed_mw.sum() > 1e-3:
-            self._notes.append(f"Autonomously shed {a.shed_mw.sum():.1f} MW of flexible load")
+            items.append(f"Shed {a.shed_mw.sum():.1f} MW of flexible load")
+        if a.unserved_critical_mw.sum() > 1e-3:
+            items.append(f"Critical load short by {a.unserved_critical_mw.sum():.1f} MW (physical shortage)")
         if a.grid_export_mw > 0.8 * st.export_limit_mw > 0:
-            self._notes.append(f"Large export {a.grid_export_mw:.1f} MW (near line limit)")
+            items.append(f"Large export {a.grid_export_mw:.1f} MW (near line limit)")
+        for it in items:
+            self._notes.append(f"Autonomous high-impact action: {it}")
+            self.high_impact.append({"time": clock(st.tick), "tick": st.tick, "action": it, "acknowledged": False})
 
     # ------------------------------------------------------------ logging
     def _log(self, d: Decision) -> None:

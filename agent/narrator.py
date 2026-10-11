@@ -39,4 +39,7 @@ def explain(chosen: Dict[str, Any], options: List[Dict[str, Any]], tolerance: fl
                    f"scores worse once worst-case cost, CO₂ or battery wear are counted.")
     else:
         why = "It is also the cheapest safe option."
+    if chosen["p_shortfall"] > tolerance:
+        why = (f"No plan could keep the risk of cutting critical load within {tolerance:.0%}, so I chose the least "
+               f"risky one and am protecting critical load first.")
     return f"{first} {why} This tick I {summary}."

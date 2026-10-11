@@ -155,45 +155,78 @@ def test_operation_measures_savings_vs_baseline(cfg, tmp_path):
     assert {"money_saved_rs", "carbon_saved_t", "generation_efficiency_pct", "energy_produced_mwh"} <= set(out)
 
 
-# ---------------------------------------------------------------- scripted fake Claude
+# ---------------------------------------------------------------- scripted fake LLM (any provider)
 class FakeClient:
-    def __init__(self, pick=None, fail=False):
-        self.pick, self.fail, self.calls = pick, fail, 0
-        self.messages = SimpleNamespace(create=self.create)
+    """Stands in for agent.llm.LLMClient: reads the briefing, optionally proposes a plan, then decides."""
 
-    def create(self, **kw):
+    label = "fake:model"
+
+    def __init__(self, pick=None, fail=False, propose=None):
+        self.pick, self.fail, self.propose, self.calls, self.proposal_results = pick, fail, propose, 0, []
+
+    def run_tools(self, system, user, tools, handler, final_tool, max_turns=4, force_first=None):
         self.calls += 1
         if self.fail:
             raise RuntimeError("API down")
-        brief = json.loads(kw["messages"][0]["content"].split("(JSON):\n", 1)[1].split("\n\nDecide", 1)[0])
-        choice = self.pick(brief) if self.pick else brief["recommended_by_ladder"]
-        return SimpleNamespace(content=[SimpleNamespace(type="tool_use", name="submit_decision", id="t1", input={
-            "option_id": choice, "diagnosis": "Calm and cheap.", "explanation": "LLM explanation."})])
+        assert {t["name"] for t in tools} == {"propose_plan", "submit_decision"}
+        brief = json.loads(user.split("(JSON):\n", 1)[1].split("\n\nOptionally", 1)[0])
+        if self.propose:
+            self.proposal_results.append(handler("propose_plan", self.propose))
+        choice = self.pick(brief, self.proposal_results) if self.pick else brief["recommended_by_ladder"]
+        return {"option_id": choice, "diagnosis": "Calm and cheap.", "explanation": "LLM explanation."}
 
 
 def _fake_llm(client):
-    llm = LLMReasoner.__new__(LLMReasoner)
-    llm.client, llm.model = client, "fake"
-    return llm
+    return LLMReasoner(client)
 
 
 def test_llm_picks_among_eligible_and_is_throttled(cfg, tmp_path):
-    client = FakeClient(pick=lambda b: b["eligible"][-1])
+    client = FakeClient(pick=lambda b, r: b["eligible"][-1])
     sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(client))
     _advance(agent, 24)
-    llm_ticks = [d for d in agent.decisions if d.reasoner == "llm"]
+    llm_ticks = [d for d in agent.decisions if d.reasoner.startswith("llm")]
     assert 3 <= len(llm_ticks) < 24
     assert llm_ticks[0].explanation == "LLM explanation." and llm_ticks[0].diagnosis == "Calm and cheap."
+    assert agent.llm_status["state"] == "on" and agent.llm_status["ok"] == len(llm_ticks)
+
+
+def test_llm_can_propose_and_win_with_its_own_plan(cfg, tmp_path):
+    proposal = {"reserve_pct": 0.33, "w_cost": 0.5, "w_clean": 0.3, "w_reliability": 0.2, "caution": 0.2,
+                "reason": "test"}
+
+    def pick(brief, results):
+        mine = results[-1]
+        return mine["option_id"] if mine["status"] == "eligible" else brief["recommended_by_ladder"]
+    client = FakeClient(pick=pick, propose=proposal)
+    sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(client))
+    d = agent.step()
+    res = client.proposal_results[0]
+    assert res["status"] in ("eligible", "too risky", "invalid") and "row" in res     # evaluated like any plan
+    mine = next(o for o in d.options if o["stage"] == "llm")
+    assert abs(mine["reserve_pct"] - 0.33) < 1e-6
+    if res["status"] == "eligible":
+        assert d.chosen == mine["id"] and agent.llm_status["proposals_won"] == 1
 
 
 def test_llm_cannot_choose_ineligible_plan(cfg, tmp_path):
-    sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(FakeClient(pick=lambda b: "O99")))
+    sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(FakeClient(pick=lambda b, r: "O99")))
     d = agent.step()
     assert "non-eligible" in d.llm_error and d.chosen != "O99"
 
 
-def test_llm_outage_keeps_running(cfg, tmp_path):
+def test_llm_outage_keeps_running_and_is_visible(cfg, tmp_path):
     sim, agent = _agent(cfg, tmp_path, llm=_fake_llm(FakeClient(fail=True)))
     _advance(agent, 12)
     assert all(d.validation["passed"] for d in agent.decisions)
     assert any("API down" in d.llm_error for d in agent.decisions)
+    assert agent.llm_status["state"] == "error" and "API down" in agent.llm_status["last_error"]
+
+
+def test_operator_override_hands_control_to_safe_controller(cfg, tmp_path):
+    sim, agent = _agent(cfg, tmp_path)
+    agent.step()
+    agent.operator_override = True
+    d = agent.step()
+    assert d.plan_source == "operator override" and d.options == [] and d.validation["passed"]
+    agent.operator_override = False
+    assert agent.step().plan_source != "operator override"

@@ -1,0 +1,4 @@
+{"storm_grade": [[0, 27], [10, 43], [50, 52], [90, 60]],
+ "explanation_example": "I tested 33 combinations from 9 recipe bands across 100 possible futures and chose a 'Protective' plan (keep ≥52% battery reserve) … 'Max savings' would save money but risks a critical shortfall in 50% of futures (limit 2%).",
+ "learn": {"wind_true": -10.7, "wind_learned": -9.1, "demand_true": -2.9, "demand_learned": -3.3,
+           "wind_mae_before": 0.93, "wind_mae_after": 0.47, "demand_mae_before": 4.51, "demand_mae_after": 1.81}}

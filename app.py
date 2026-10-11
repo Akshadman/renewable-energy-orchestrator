@@ -18,8 +18,11 @@ try:
 except ImportError:  # optional dependency
     pass
 
+from agent.llm import from_env as llm_from_env
 from agent.runner import Operation
-from core.config import config_from_dict, config_to_dict, list_profiles, load_config, save_profile, validate_config
+from core.multimodal.intake import load_folder
+from core.multimodal.samples import build_sample_pack
+from core.config import ROOT, config_from_dict, config_to_dict, list_profiles, load_config, save_profile, validate_config
 from core.data_sources import SOURCE_LABELS, SOURCES, load_weather_day, today_ist
 from core.events import make_event
 from core.simulator import Simulator, clock
@@ -47,16 +50,31 @@ def ss() -> Any:
 
 
 def _has_key() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    return llm_from_env() is not None
+
+
+SAMPLE_DIR = ROOT / "data" / "multimodal_samples"
 
 
 def start_day(raw: Dict[str, Any], source: str, day: Date, seed: int, use_llm: bool) -> None:
-    """Build the AI twin, the baseline twin and the agent for one operating day."""
+    """Build the AI twin, the baseline twin and the agent for one operating day, then read multimodal inputs."""
     cfg = config_from_dict(raw)
     with st.spinner(f"Loading weather ({SOURCE_LABELS[source]})…"):
         weather = load_weather_day(source, cfg, day, seed)
     sim = Simulator(cfg, seed=seed, weather=weather, day=day)
-    ss().op = Operation(cfg, sim, use_llm=use_llm, persist_learning=True)
+    op = Operation(cfg, sim, use_llm=use_llm, persist_learning=True)
+    mm = ss().get("mm_opts", {"satellite": True, "samples": True})
+    with st.spinner("Reading satellite images, inspection images and documents…"):
+        if mm.get("satellite") and weather.source != "synthetic":
+            op.check_satellite()
+        files = list(ss().get("mm_files", {}).items())
+        if mm.get("samples"):
+            if not SAMPLE_DIR.exists():
+                build_sample_pack(SAMPLE_DIR)
+            files = load_folder(SAMPLE_DIR) + files
+        if files:
+            op.ingest(files)
+    ss().op = op
     ss().update(raw=raw, playing=False, requested_source=source)
 
 
@@ -95,8 +113,21 @@ def sidebar() -> None:
                 f"**Prices:** {op.sim.profile.price_source}")
     if w.source != ss().requested_source:
         sb.warning("Fell back: " + " · ".join(w.notes))
-    sb.markdown(f"**AI reasoning:** {'Claude + optimizer' if op.agent.mode == 'llm' else 'Optimizer + rules (offline)'}")
-    sb.caption("Fully autonomous — no human approval needed. Every action is logged.")
+    ls = op.agent.llm_status
+    badge = {"on": "🟢 ON", "configured": "🟡 ready", "error": "🔴 FAILED", "off": "⚪ OFF"}[ls["state"]]
+    sb.markdown(f"**LLM:** {badge}" + (f" · `{ls['provider']}`" if ls["provider"] else " · optimizer + ladder decide"))
+    if ls["state"] == "on":
+        sb.caption(f"{ls['ok']}/{ls['calls']} consultations ok · {ls['proposals']} own plans proposed, "
+                   f"{ls['proposals_won']} chosen")
+    if ls["state"] == "error":
+        sb.error(f"LLM call failed — the optimizer decided instead.\n\n{ls['last_error'][:160]}")
+    sb.divider()
+    sb.markdown("**Human oversight**")
+    op.override = sb.toggle("🛑 Operator override (hand control to safe mode)", value=op.override,
+                            help="Immediately suspends AI planning; the safe rule-based controller runs until you "
+                                 "switch this off. Every tick is still logged.")
+    pending = [h for h in op.agent.high_impact if not h["acknowledged"]]
+    sb.caption(f"Autonomous within your risk & target limits · {len(pending)} high-impact action(s) awaiting review")
 
 
 # ================================================================ tab 1 — industry setup
@@ -123,8 +154,9 @@ def setup_tab() -> None:
                                      "saved day → simulated weather.")
         day = c[1].date_input("Operating day", o["day"])
         seed = int(c[2].number_input("Random seed", 0, 10_000, o["seed"]))
-        use_llm = c[3].toggle("Use Claude", o["use_llm"] and _has_key(), disabled=not _has_key(),
-                              help="Needs ANTHROPIC_API_KEY in .env. Without it the optimizer + rules decide.")
+        use_llm = c[3].toggle("Use LLM", o["use_llm"] and _has_key(), disabled=not _has_key(),
+                              help="Needs one key in .env: ANTHROPIC_API_KEY, GROQ_API_KEY (free), GEMINI_API_KEY "
+                                   "(free) or OPENROUTER_API_KEY. Without it the optimizer + ladder decide.")
 
         st.subheader("2 · Demand (your loads)")
         st.caption("Critical % is never cut. Flexible load can be reduced through paid demand response.")
@@ -197,6 +229,18 @@ def setup_tab() -> None:
         aversion = tc[3].slider("Worst-case aversion", 0.0, 1.0, float(t.get("risk_aversion", 0.3)), 0.05,
                                 help="0 = only average cost matters · 1 = worst case matters as much")
 
+        st.subheader("6 · Multimodal inputs")
+        st.caption("Satellite images, thermal / drone inspection images (PNG/JPG) and documents (PDF / TXT: work "
+                   "orders, fault reports, grid notices, production notices). Findings below 75% confidence are "
+                   "quarantined — shown, never acted on.")
+        mm = ss().get("mm_opts", {"satellite": True, "samples": True})
+        m1, m2 = st.columns(2)
+        use_sat = m1.checkbox("Check NASA satellite images for every solar farm", mm["satellite"],
+                              help="Real MODIS scenes; compared with the weather forecast (needs live / last-year data)")
+        use_samples = m2.checkbox("Include the sample inspection images & documents", mm["samples"])
+        uploads = st.file_uploader("Upload images or documents", type=["png", "jpg", "jpeg", "pdf", "txt", "md"],
+                                   accept_multiple_files=True)
+
         b1, b2 = st.columns(2)
         apply = b1.form_submit_button("✅ Apply & start day", type="primary", width="stretch")
         save = b2.form_submit_button("💾 Save as profile", width="stretch")
@@ -212,6 +256,8 @@ def setup_tab() -> None:
             st.success(f"Saved profile: {save_profile(config_from_dict(new)).name}")
         if apply:
             ss().run_opts = {"source": source, "day": day, "seed": seed, "use_llm": use_llm}
+            ss().mm_opts = {"satellite": use_sat, "samples": use_samples}
+            ss().mm_files = {f.name: f.getvalue() for f in (uploads or [])}
             start_day(new, source, day, seed, use_llm)
             _clear_editors()
             st.success("Applied — open **⚡ 2 · Live control room** and press ▶ Play.")
@@ -264,6 +310,7 @@ def _build_raw(raw, name, loads, solar, wind, bats, imp, exp, maint, carbon, cos
 def live_tab() -> None:
     op = ss().op
     status_banner(op)
+    oversight_panel(op)
     output_cards(op)
     if not op.sim.history:
         st.info("Press **▶ Play** (or **⏭ Step**) in the sidebar to start the day.")
@@ -273,8 +320,53 @@ def live_tab() -> None:
     thinking(op)
     st.divider()
     inject_panel(op)
+    evidence_panel(op)
     with st.expander("📜 Action log (every decision, newest first)"):
         action_log(op)
+
+
+def oversight_panel(op: Operation) -> None:
+    """Operator view of autonomous high-impact actions (shedding, big exports, moved maintenance)."""
+    if op.override:
+        st.error("🛑 **Operator override active** — AI planning is suspended and the safe controller is running. "
+                 "Switch it off in the sidebar to hand control back to the AI.")
+    pending = [h for h in op.agent.high_impact if not h["acknowledged"]]
+    if pending:
+        st.warning(f"⚠️ {len(pending)} autonomous high-impact action(s) for review — the AI acted within your "
+                   f"limits; please check them.")
+        with st.expander(f"Review high-impact actions ({len(pending)})"):
+            for h in pending[-8:]:
+                st.markdown(f"- **{h['time']}** — {h['action']}")
+            if st.button("✔ Mark all as reviewed"):
+                for h in pending:
+                    h["acknowledged"] = True
+                st.rerun()
+
+
+def evidence_panel(op: Operation) -> None:
+    """Everything the AI read from images, satellite scenes and documents — and what it did with it."""
+    st.subheader("📥 Evidence from images & documents")
+    st.caption("Satellite scenes, thermal inspections and written notices are turned into findings. Only findings "
+               "with ≥75% confidence change the plan; the rest are quarantined for a human to check.")
+    if op.evidence:
+        icon = {"applied": "✅ applied", "quarantined": "⏸ quarantined", "info": "ℹ️ info", "rejected": "❌ rejected"}
+        st.dataframe(pd.DataFrame([{
+            "Source": {"satellite": "🛰️ satellite", "thermal_image": "🌡️ thermal image",
+                       "document": "📄 document"}.get(e.modality, e.modality),
+            "File / scene": e.source, "Finding": e.summary.split(": ", 1)[-1], "Confidence": f"{e.confidence:.0%}",
+            "Status": icon.get(e.status, e.status), "Why held back": e.reason} for e in reversed(op.evidence)]),
+            hide_index=True, width="stretch")
+    else:
+        st.caption("No multimodal inputs yet.")
+    with st.form("feed_now", clear_on_submit=True):
+        files = st.file_uploader("Feed a new image or document right now", accept_multiple_files=True,
+                                 type=["png", "jpg", "jpeg", "pdf", "txt", "md"])
+        if st.form_submit_button("📨 Send to the AI", disabled=op.done) and files:
+            found = op.ingest([(f.name, f.getvalue()) for f in files])
+            st.toast(f"{sum(e.status == 'applied' for e in found)} applied, "
+                     f"{sum(e.status == 'quarantined' for e in found)} quarantined", icon="📥")
+            op.step()                       # re-plan immediately
+            st.rerun()
 
 
 def status_banner(op: Operation) -> None:
@@ -647,6 +739,17 @@ def best_recipe_section(op: Operation) -> None:
     passed_safety = [o for o in opts if o["status"] != "invalid"]
     eligible = [o for o in opts if o["status"] == "eligible"]
     tol = op.cfg.targets.get("max_shortfall_prob", 0.02)
+    if not eligible:      # nothing met the risk limit → the least risky plan was chosen
+        steps = [
+            ("✅", "1 · Safety", f"{len(passed_safety)} of {len(opts)} combinations passed the physics check."),
+            ("⚠️", "2 · Reliability", f"no combination kept the risk of cutting critical load within {tol:.0%} "
+                                    f"(best achievable: {ch['p_shortfall']:.0%}), so the least risky one was chosen."),
+            ("➖", "3 · Cost vs clean", "not used — protecting critical load comes first."),
+            ("➖", "4 · Battery life", "not used."),
+        ]
+        for icon, title, text in steps:
+            st.markdown(f"{icon} **{title}** — {text}")
+        return
     steps = [
         ("1 · Safety", f"{len(passed_safety)} of {len(opts)} combinations passed the physics check."),
         ("2 · Reliability", f"{len(eligible)} kept the risk of cutting critical load at or below {tol:.0%}"

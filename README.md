@@ -11,6 +11,29 @@ It works for **any industry**. You describe your site (loads, consumption data, 
 
 ---
 
+## Grid position: **D3 × F3**
+
+| Axis | Requirement | Evidence in this repo |
+|---|---|---|
+| **D3** | Highly heterogeneous multimodal input | NASA MODIS satellite images · thermal / drone PV images · PDF work orders & grid notices · free-text fault reports & emails · weather API JSON · price & consumption CSV · config tables (`core/multimodal/`) |
+| **D3** | High degree of demonstrable reliability | `python -m eval.multimodal_eval`: 0 wrong findings applied across 256 labelled image & document cases, 100% of vague notices quarantined, satellite cloud error 0.3 pts; 0 safety violations over 100 simulated days |
+| **F3** | Simulate the situation over time with varying inputs | 100 sampled futures per decision, 24 h day-ahead plan, full-day digital twin with 11 shocks, 100-day Monte Carlo |
+
+Not claimed: audio input; thermal test images are synthetic with ground truth (no real drone data available); plant meters come from a digital twin.
+
+## Multimodal intake (D3)
+- **Satellite** (`core/multimodal/satellite.py`): real NASA GIBS MODIS scene around each solar farm → cloud mask → compared with the forecast at the ~10:30 overpass; a ≥25-point gap derates or uplifts that farm.
+- **Thermal images** (`thermal.py`): per-module median → noise filter → robust threshold → hot-spot modules → capacity derate + a repair job the agent schedules. Noisy / over-exposed images are quarantined.
+- **Documents** (`documents.py`): PDF / TXT work orders, fault reports, SLDC notices, production notices → kind, asset, time window, size (rule parser, or the configured LLM) → validation → confidence.
+- **Gate** (`intake.py`): findings ≥75% confidence are applied to both twins (AI and business-as-usual) and raise alerts the agent re-plans on; the rest are quarantined and shown to operators. Corrupt files are rejected without stopping control.
+- Sample pack: `data/multimodal_samples/` (loaded by default in the dashboard).
+
+## LLM (optional, any provider)
+`agent/llm.py` picks the first key in `.env`: Claude, **Groq (free)**, **Gemini (free)**, OpenRouter, or a local OpenAI-compatible server (Ollama). The LLM receives the full briefing, may **propose its own plan settings** (`propose_plan`), which are optimised and stress-tested like every other plan, then chooses among *eligible* plans and explains. It never outputs megawatts; ineligible choices are rejected in code. The sidebar shows LLM status ON / OFF / FAILED.
+
+## Human oversight
+Operator override switch (hands control to the safe controller instantly) · high-impact actions (load shedding, large exports, moved maintenance) flagged for review · quarantine queue for low-confidence findings · full JSONL audit log.
+
 ## Quick start
 
 ```bash
@@ -20,7 +43,9 @@ pip install -r requirements.txt
 cp .env.example .env            # optional: add ANTHROPIC_API_KEY to let Claude choose & explain
 
 streamlit run app.py            # dashboard (works with no API key and no internet)
-pytest                          # 70 tests (~5 min: several simulate full days)
+pytest                          # 89 tests (~10 min: several simulate full days)
+python -m eval.multimodal_eval  # D3 reliability on labelled images & documents
+python deck/build_deck.py       # rebuild the solution deck (PDF) from real results
 python -m eval.evaluate --n 100 # Monte Carlo: AI vs business-as-usual vs no-battery
 ```
 

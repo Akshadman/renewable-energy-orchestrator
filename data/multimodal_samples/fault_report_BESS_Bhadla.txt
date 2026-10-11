@@ -1,0 +1,4 @@
+FAULT REPORT
+Asset: BESS-Bhadla (B1)
+The power conversion system tripped at 13:45 on an over-temperature alarm. Battery is out of service with immediate effect.
+Expected restoration: approx 4 hours.

@@ -1,0 +1,53 @@
+{
+  "thermal": {
+    "easy": {
+      "images": 50,
+      "exact_count_pct": 100.0,
+      "mae_modules": 0.0,
+      "mae_derate_pts": 0.0,
+      "inspection_flag_accuracy_pct": 100.0,
+      "applied": 49,
+      "wrong_applied": 0
+    },
+    "medium": {
+      "images": 50,
+      "exact_count_pct": 100.0,
+      "mae_modules": 0.0,
+      "mae_derate_pts": 0.0,
+      "inspection_flag_accuracy_pct": 100.0,
+      "applied": 47,
+      "wrong_applied": 0
+    },
+    "hard": {
+      "images": 50,
+      "exact_count_pct": 16.0,
+      "mae_modules": 2.78,
+      "mae_derate_pts": 1.16,
+      "inspection_flag_accuracy_pct": 88.0,
+      "applied": 0,
+      "wrong_applied": 0
+    }
+  },
+  "documents": {
+    "docs": 200,
+    "clear": 160,
+    "ambiguous": 40,
+    "applied": 160,
+    "applied_correct": 160,
+    "wrong_applied": 0,
+    "clear_quarantined": 0,
+    "ambiguous_quarantined_or_ignored": 40,
+    "kind_correct": 160,
+    "kind_accuracy_pct": 100.0,
+    "applied_precision_pct": 100.0,
+    "clear_coverage_pct": 100.0,
+    "ambiguous_caught_pct": 100.0
+  },
+  "satellite": {
+    "real_background_scenes": 9,
+    "synthetic_cloud_tests": 60,
+    "mae_cloud_pct_pts": 0.33,
+    "max_error_pts": 2.5,
+    "within_10pts_pct": 100.0
+  }
+}
