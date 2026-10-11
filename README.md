@@ -1,6 +1,6 @@
 # ⚡ Renewable Energy Orchestrator
 
-An **autonomous** AI control room for an industrial renewable energy portfolio. Every 15 minutes, and immediately after any shock, it decides how to run solar farms, wind farms, batteries, flexible loads and the grid connection. The goals are to **minimise cost, maximise clean energy and never cut critical load**. There is no human in the loop: the AI decides, acts and explains, and every action is logged.
+An **autonomous** AI control room for an industrial renewable energy portfolio. Every 15 minutes, and immediately after any shock, it decides how to run solar farms, wind farms, batteries, flexible loads and the grid connection. The goals are to **minimise cost, maximise clean energy and never cut critical load**. The AI decides, acts and explains within limits set by management; operators can override it at any time, and every action is logged.
 
 It works for **any industry**. You describe your site (loads, consumption data, generation resources, limits, maintenance and breakdown schedule, carbon and cost targets) in the dashboard, and the AI adapts.
 
@@ -16,10 +16,10 @@ It works for **any industry**. You describe your site (loads, consumption data, 
 | Axis | Requirement | Evidence in this repo |
 |---|---|---|
 | **D3** | Highly heterogeneous multimodal input | NASA MODIS satellite images · thermal / drone PV images · PDF work orders & grid notices · free-text fault reports & emails · weather API JSON · price & consumption CSV · config tables (`core/multimodal/`) |
-| **D3** | High degree of demonstrable reliability | `python -m eval.multimodal_eval`: 0 wrong findings applied across 256 labelled image & document cases, 100% of vague notices quarantined, satellite cloud error 0.3 pts; 0 safety violations over 100 simulated days |
+| **D3** | High degree of demonstrable reliability | `python -m eval.multimodal_eval`: 0 wrong of 256 applied findings, from 350 labelled images and documents; 100% of vague notices quarantined; 0.33 pts mean cloud error on 60 synthetic clouds over 9 real NASA scenes of our sites (a favourable test for a whiteness detector); 0 safety violations over 100 simulated days |
 | **F3** | Simulate the situation over time with varying inputs | 100 sampled futures per decision, 24 h day-ahead plan, full-day digital twin with 11 shocks, 100-day Monte Carlo |
 
-Not claimed: audio input; thermal test images are synthetic with ground truth (no real drone data available); plant meters come from a digital twin.
+Not claimed: audio input; thermal test images are synthetic with ground truth (no real drone data available), and real drone images without temperature-calibration metadata are analysed but held for operator review until calibrated with the camera's temperature range (by design); plant meters come from a digital twin.
 
 ## Multimodal intake (D3)
 - **Satellite** (`core/multimodal/satellite.py`): real NASA GIBS MODIS scene around each solar farm → cloud mask → compared with the forecast at the ~10:30 overpass; a ≥25-point gap derates or uplifts that farm.

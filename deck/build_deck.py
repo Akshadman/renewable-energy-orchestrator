@@ -40,6 +40,8 @@ MM = json.loads((ROOT / "eval/results/multimodal.json").read_text())
 TH, DOC, SAT = MM["thermal"], MM["documents"], MM["satellite"]
 th_applied = sum(v["applied"] for v in TH.values())
 th_wrong = sum(v["wrong_applied"] for v in TH.values())
+LABELLED = sum(v["images"] for v in TH.values()) + DOC["docs"]          # labelled images + documents
+APPLIED = th_applied + DOC["applied"]                                    # findings the confidence gate let through
 SHOTS = {p.stem: p for p in sorted((ROOT / "deck/screens").glob("*.png"))} if (ROOT / "deck/screens").exists() else {}
 
 slides: List[str] = []
@@ -127,6 +129,8 @@ def img(name: str, cls: str = "shot") -> str:
 NOT_CLAIMED = ul(["Audio / voice input is not supported yet",
                   "Thermal inspection images are synthetic with known ground truth (no real drone data was available); "
                   "satellite scenes, weather data and document formats are real",
+                  "Real drone images without temperature-calibration metadata are analysed but held for operator "
+                  "review until calibrated with the camera's temperature range (by design)",
                   "Plant meters come from a physics-based digital twin; the same interface accepts live SCADA"])
 cost_red, co2_red = pct(ai.cost_rs, bau.cost_rs), pct(ai.co2_t, bau.co2_t)
 crit_red = pct(ai.unserved_critical_mwh, bau.unserved_critical_mwh)
@@ -203,7 +207,7 @@ multimodal input, high reliability</p></div>
               "Satellite images (NASA MODIS) · thermal / drone images · PDF work orders & grid notices · free-text "
               "fault reports & emails · weather API (JSON) · price & consumption CSV · config tables"],
              ["<b>D3</b>", "High degree of demonstrable reliability",
-              f"0 wrong findings applied in {th_applied + DOC['applied']} labelled image & document cases · "
+              f"0 wrong of {APPLIED} applied findings, from {LABELLED} labelled images and documents · "
               f"{DOC['ambiguous_caught_pct']:.0f}% of vague notices quarantined · 0 safety violations in {N} days · "
               f"cheaper than business-as-usual on {CHEAPER}/{N} days"],
              ["<b>F3</b>", "Simulate over time with varying inputs",
@@ -256,18 +260,22 @@ slide("D3: demonstrable reliability on labelled data", "Measured accuracy, and �
 <div>{table(th_rows, widths=(26, 14, 26, 16, 18))}
 <p class="muted small">Hard tier = heavy sensor noise + sun glare: detection is unreliable, so every one is
 quarantined instead of applied.</p>
-{table([["Satellite cloud detector", "Result"], ["Real NASA scenes of our sites", str(SAT['real_background_scenes'])],
-        ["Tests with known synthetic cloud", str(SAT['synthetic_cloud_tests'])],
-        ["Mean error", f"{SAT['mae_cloud_pct_pts']} % points (max {SAT['max_error_pts']})"]], widths=(60, 40))}</div>
+{table([["Satellite cloud detector", "Result"],
+        ["Test", f"{SAT['synthetic_cloud_tests']} synthetic clouds over {SAT['real_background_scenes']} real NASA scenes "
+                 "of our sites"],
+        ["Mean error", f"{SAT['mae_cloud_pct_pts']} % points (max {SAT['max_error_pts']})"]], widths=(40, 60))}
+<p class="muted small">The detector is a whiteness threshold, so this controlled test is favourable to it; real hazy
+or thin cloud is harder, which is why the satellite reading is cross-checked against the forecast before acting.</p>
+</div>
 <div>{table([["Documents (200 notices)", "Result"], ["Clear notices applied correctly",
              f"{DOC['applied_correct']} / {DOC['clear']} ({DOC['applied_precision_pct']:.0f}%)"],
             ["Vague / tentative notices quarantined", f"{DOC['ambiguous_quarantined_or_ignored']} / {DOC['ambiguous']} "
              f"({DOC['ambiguous_caught_pct']:.0f}%)"],
             ["Wrong findings applied", f"<b>{DOC['wrong_applied']}</b>"],
             ["Formats covered", "24 h, 12 h am/pm, 'hrs', durations, ranges, dates, filler text, PDF"]], widths=(55, 45))}
-<div class="callout good"><h3>Safety metric across all modalities</h3><p><b>0 wrong findings applied</b> out of
-{th_applied + DOC['applied']} applied image and document findings. Corrupt or unsupported files are rejected without
-interrupting control.</p></div></div></div>''')
+<div class="callout good"><h3>Safety metric across all modalities</h3><p><b>0 wrong of {APPLIED} applied findings</b>,
+from {LABELLED} labelled images and documents. Corrupt or unsupported files are rejected without interrupting
+control.</p></div></div></div>''')
 
 # 7 features
 slide("Feature evidence: F1 → F2 → F3", "Each level is demonstrated live in the prototype and verified by tests", "F3",
@@ -582,8 +590,15 @@ out_html.write_text(f'<!doctype html><html><head><meta charset="utf-8"><title>Re
                     f'Solution Deck</title><style>{CSS}</style></head><body>{"".join(slides)}</body></html>')
 out_pdf = ROOT / "deck" / "Solution_Deck.pdf"
 out_pdf.unlink(missing_ok=True)
-subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--print-to-pdf={out_pdf}",
-                out_html.as_uri()], capture_output=True, timeout=120)   # Chrome may exit non-zero on harmless warnings
+proc = subprocess.Popen([CHROME, "--headless=new", "--disable-gpu", "--no-first-run", "--user-data-dir=/tmp/deck_pdf",
+                         "--no-pdf-header-footer", f"--print-to-pdf={out_pdf}", out_html.as_uri()],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    proc.wait(timeout=180)          # Chrome sometimes keeps running after writing the PDF
+except subprocess.TimeoutExpired:
+    pass
+finally:
+    proc.kill()
 if not out_pdf.exists():
     raise SystemExit("PDF was not produced — is Google Chrome installed?")
 print(f"{len(slides)} slides → {out_html.name}, {out_pdf.name}")
