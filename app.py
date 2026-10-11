@@ -28,8 +28,6 @@ from core.events import make_event
 from core.simulator import Simulator, clock
 from eval.evaluate import CONTROLLERS, METRICS, OUT_DIR, run_monte_carlo, save_outputs, summarize
 
-st.set_page_config(page_title="Renewable Energy Orchestrator", page_icon="⚡", layout="wide")
-
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]          # categorical, fixed order
 INK = "#52514e"
 STATUS = {"ok": "#2e9e5b", "info": "#2a78d6", "warning": "#d98a00", "critical": "#d64545"}
@@ -89,6 +87,14 @@ def init() -> None:
 
 
 # ================================================================ sidebar
+def _switch_override() -> None:
+    """Operator flipped the override: hand over control and act on it right away (like an injected shock)."""
+    op = ss().op
+    op.override = ss().override_toggle
+    if not op.done:
+        op.step()
+
+
 def sidebar() -> None:
     op, sb = ss().op, st.sidebar
     sb.title("⚡ Orchestrator")
@@ -123,9 +129,11 @@ def sidebar() -> None:
         sb.error(f"LLM call failed — the optimizer decided instead.\n\n{ls['last_error'][:160]}")
     sb.divider()
     sb.markdown("**Human oversight**")
-    op.override = sb.toggle("🛑 Operator override (hand control to safe mode)", value=op.override,
-                            help="Immediately suspends AI planning; the safe rule-based controller runs until you "
-                                 "switch this off. Every tick is still logged.")
+    if ss().get("override_toggle") != op.override:      # keep the switch in sync after a restart / new day
+        ss().override_toggle = op.override
+    sb.toggle("🛑 Operator override (hand control to safe mode)", key="override_toggle", on_change=_switch_override,
+              help="Takes effect immediately: the next 15-min tick runs at once under the safe rule-based controller, "
+                   "and AI planning stays suspended until you switch this off. Every tick is still logged.")
     pending = [h for h in op.agent.high_impact if not h["acknowledged"]]
     sb.caption(f"Autonomous within your risk & target limits · {len(pending)} high-impact action(s) awaiting review")
 
@@ -337,10 +345,18 @@ def oversight_panel(op: Operation) -> None:
         with st.expander(f"Review high-impact actions ({len(pending)})"):
             for h in pending[-8:]:
                 st.markdown(f"- **{h['time']}** — {h['action']}")
+            if len(pending) > 8:
+                st.caption(f"Showing the latest 8 of {len(pending)}.")
             if st.button("✔ Mark all as reviewed"):
                 for h in pending:
                     h["acknowledged"] = True
                 st.rerun()
+    else:
+        reviewed = len(op.agent.high_impact)
+        st.caption(f"🧑‍✈️ Human oversight: no high-impact actions awaiting review"
+                   f"{f' ({reviewed} already reviewed)' if reviewed else ''}. Load shedding, critical-load "
+                   f"shortfalls, exports near the line limit and moved maintenance are flagged here, including "
+                   f"ticks run under the operator override.")
 
 
 def evidence_panel(op: Operation) -> None:
@@ -778,6 +794,7 @@ def best_recipe_section(op: Operation) -> None:
 
 # ================================================================ main
 def main() -> None:
+    st.set_page_config(page_title="Renewable Energy Orchestrator", page_icon="⚡", layout="wide")
     init()
     sidebar()
     t1, t2, t3 = st.tabs(["🏭 1 · Your industry", "⚡ 2 · Live control room", "📊 3 · Results & learning"])
@@ -800,4 +817,7 @@ def main() -> None:
         st.toast("Day complete ✅ — see 📊 Results & learning")
 
 
-main()
+# `streamlit run` executes this file as __main__. The guard stops the Monte Carlo worker processes (which re-import
+# the main module on Windows) from running the whole dashboard in every worker.
+if __name__ == "__main__":
+    main()

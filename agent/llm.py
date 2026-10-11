@@ -3,7 +3,7 @@
 Picks the first configured provider from the environment:
   ANTHROPIC_API_KEY  → Claude (Anthropic Messages API)
   GROQ_API_KEY       → Groq (OpenAI-compatible, free tier)       default model llama-3.3-70b-versatile
-  GEMINI_API_KEY     → Google Gemini (OpenAI-compatible endpoint) default model gemini-2.5-flash
+  GEMINI_API_KEY     → Google Gemini (OpenAI-compatible endpoint) default model gemini-3.8-flash
   OPENROUTER_API_KEY → OpenRouter (OpenAI-compatible)
   LLM_BASE_URL       → any OpenAI-compatible server, e.g. Ollama at http://localhost:11434/v1
 LLM_MODEL overrides the default model; LLM_PROVIDER forces a provider.
@@ -12,16 +12,19 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
 OPENAI_COMPAT = {
     "groq": ("GROQ_API_KEY", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"),
-    "gemini": ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.5-flash"),
+    "gemini": ("GEMINI_API_KEY", "https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.8-flash"),
     "openrouter": ("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1", "meta-llama/llama-3.3-70b-instruct:free"),
 }
 DEFAULT_CLAUDE = "claude-sonnet-5"
+RETRY_STATUS = {429, 500, 502, 503, 504}
+RETRY_WAITS_S = (2.0, 5.0)              # two retries, then the optimizer + ladder decide this tick
 
 Handler = Callable[[str, Dict[str, Any]], Dict[str, Any]]
 
@@ -78,27 +81,53 @@ class LLMClient:
         raise LLMError("no final decision within turn limit")
 
     # ------------------------------------------------------------ OpenAI-compatible (Groq, Gemini, OpenRouter, Ollama)
+    def _post(self, url: str, body: Dict[str, Any], headers: Dict[str, str]) -> Any:
+        """POST with short retries on transient overload (free tiers often answer 429 / 503 under load)."""
+        for wait in RETRY_WAITS_S + (None,):
+            try:
+                r = requests.post(url, json=body, headers=headers, timeout=self.timeout)
+            except requests.ConnectionError:       # dropped connection under load (not timeouts: those already
+                if wait is None:                   # cost a full timeout each)
+                    raise
+                time.sleep(wait)
+                continue
+            if r.status_code not in RETRY_STATUS or wait is None:
+                return r
+            try:                                   # honour a short Retry-After, never block a tick for long
+                wait = min(float(r.headers.get("Retry-After", wait)), 10.0)
+            except (TypeError, ValueError):
+                pass
+            time.sleep(wait)
+        return r
+
     def _run_openai(self, system, user, tools, handler, final_tool, max_turns, force_first):
         fns = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
                                                  "parameters": t["input_schema"]}} for t in tools]
         messages: List[Dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        for turn in range(max_turns):
+        turn, nudged = 0, False
+        while turn < max_turns:
             last = turn == max_turns - 1
             name = final_tool if last else (force_first if force_first and turn == 0 else None)
             choice = {"type": "function", "function": {"name": name}} if name else "required"
+            # Room for hidden reasoning on "thinking" models (e.g. Gemini 3.x), or the tool call gets cut off.
             body = {"model": self.model, "messages": messages, "tools": fns, "tool_choice": choice, "temperature": 0.2,
-                    "max_tokens": 900}
+                    "max_tokens": 4096}
             headers = {"Content-Type": "application/json"}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
-            r = requests.post(f"{self.base_url.rstrip('/')}/chat/completions", json=body, headers=headers,
-                              timeout=self.timeout)
+            r = self._post(f"{self.base_url.rstrip('/')}/chat/completions", body, headers)
             if r.status_code >= 400:
                 raise LLMError(f"HTTP {r.status_code}: {r.text[:200]}")
             msg = r.json()["choices"][0]["message"]
             calls = msg.get("tool_calls") or []
             if not calls:
-                raise LLMError("model returned no tool call")
+                if nudged:
+                    raise LLMError("model returned no tool call")
+                nudged = True                      # some models answer in prose despite tool_choice: ask once more
+                messages += [{"role": "assistant", "content": msg.get("content") or "(no tool call)"},
+                             {"role": "user", "content": f"Reply only with a tool call (finish with {final_tool})."}]
+                continue
+            turn += 1
             messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
             for c in calls:
                 fname = c["function"]["name"]

@@ -166,7 +166,7 @@ class OpenMeteoProvider(WeatherProvider):
         if isinstance(payload, dict) and payload.get("error"):
             raise DataSourceError(f"Open-Meteo error: {payload.get('reason')}")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"fetched_at": time.time(), "params": params, "payload": payload}))
+        path.write_text(json.dumps({"fetched_at": time.time(), "params": params, "payload": payload}), encoding="utf-8")
         return payload
 
 
@@ -364,7 +364,7 @@ def ensure_iex_csv(path: Path, days: int = 30, seed: int = 7, end: Optional[Date
     path.parent.mkdir(parents=True, exist_ok=True)
     df = pd.concat(frames)
     path.write_text("# SAMPLE data shaped like IEX DAM 15-min MCP — replace with a real IEX export\n"
-                    + df.to_csv(index=False))
+                    + df.to_csv(index=False), encoding="utf-8")
     return path
 
 

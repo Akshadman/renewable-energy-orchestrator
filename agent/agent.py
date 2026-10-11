@@ -462,6 +462,7 @@ class OrchestratorAgent:
         """Operator override: the safe rule-based controller acts; the AI's planning is suspended."""
         action = safe_action(st, self.cfg, reserve_pct=0.2)
         vr = validate(action, st, self.cfg)
+        self._flag_high_impact(action, st)       # the operator still reviews what the safe controller did
         kpi = self.sim.step(action)
         summary = describe_action(action)
         self._notes.append("OPERATOR OVERRIDE active — AI planning suspended, safe controller in charge")
@@ -474,6 +475,8 @@ class OrchestratorAgent:
                                  f"{_summarize(summary)}.", kpi=kpi.to_dict())
         self.decisions.append(d)
         self._log(d)
+        if self.sim.done:
+            self.learner.end_of_day()
         return d
 
     def _flag_high_impact(self, a: Action, st: GridState) -> None:

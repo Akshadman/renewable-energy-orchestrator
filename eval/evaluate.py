@@ -62,8 +62,8 @@ def run_monte_carlo(n: int = 100, seed0: int = 0, n_events: int = 3, use_llm: bo
                     workers: Optional[int] = None, progress=None, config_path: Optional[str] = None,
                     controllers: Optional[List[str]] = None) -> pd.DataFrame:
     """Run ``n`` days × 3 controllers (same seeds & events for each) and return one row per run."""
-    if not use_llm:
-        os.environ.pop("ANTHROPIC_API_KEY", None)  # mock reasoner for speed/cost
+    # use_llm=False is passed to every agent, so no provider is called. (Don't delete API keys from os.environ:
+    # when this runs from the dashboard that would silently switch its LLM off.)
     jobs = [(seed0 + i, c, n_events, use_llm, config_path) for i in range(n) for c in (controllers or CONTROLLERS)]
     workers = workers if workers is not None else (1 if use_llm else min(8, os.cpu_count() or 1))
     rows: List[Dict[str, float]] = []

@@ -230,3 +230,13 @@ def test_operator_override_hands_control_to_safe_controller(cfg, tmp_path):
     assert d.plan_source == "operator override" and d.options == [] and d.validation["passed"]
     agent.operator_override = False
     assert agent.step().plan_source != "operator override"
+
+
+def test_override_actions_are_flagged_for_review(cfg, tmp_path):
+    sim, agent = _agent(cfg, tmp_path)
+    sim.apply_event(make_event("demand_surge", 0, duration=8, factor=4.0))     # forces the safe controller to shed
+    sim.apply_event(make_event("line_congestion", 0, duration=8, factor=0.1))
+    agent.operator_override = True
+    d = agent.step()
+    assert d.reasoner == "operator" and d.action_summary["shed_mw"] > 0
+    assert any("Shed" in h["action"] and not h["acknowledged"] for h in agent.high_impact)

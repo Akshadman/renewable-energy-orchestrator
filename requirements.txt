@@ -1,6 +1,6 @@
 streamlit>=1.40
 plotly>=5.20
-pulp>=2.8
+pulp>=2.8,<4    # 4.x no longer bundles the CBC solver the optimizer uses
 pandas>=2.0
 numpy>=1.24
 anthropic>=0.40
