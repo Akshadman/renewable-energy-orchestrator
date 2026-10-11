@@ -160,16 +160,17 @@ Profiles can be saved and loaded (`config/profiles/*.yaml`). The default is a Ra
 
 100 randomized synthetic days, 3 unannounced shocks per day (storms with random probabilities, breakdowns,
 price spikes, congestion, …), offline mode. All controllers see identical weather, demand, prices and shocks.
-Reproduce with `python -m eval.evaluate --n 100`. *Measured before the energy-conservation feature was removed (the default site then had a 5% demand reduction 18:30–20:00).*
+Reproduce with `python -m eval.evaluate --n 100`. 
 
 | Mean per day | **AI** | Business-as-usual | No battery |
 |---|---:|---:|---:|
-| Cost (₹ lakh) | **71.9** (−23%) | 93.2 | 100.3 |
-| Clean energy | **72.5 %** | 61.9 % | 57.6 % |
-| Curtailment (MWh) | **9.9** | 22.3 | 44.1 |
-| Load cut (MWh) | **5.4** (−82%) | 29.5 | 32.3 |
-| Safety violations | **0.00** (max 0) | 4.85 | 3.59 |
-| CO₂ (t) | **555** (−42%) | 949 | 1054 |
+| Cost (₹ lakh) | **72.4** (-23%) | 94.2 | 101.2 |
+| Clean energy | **72.4 %** | 61.6 % | 57.4 % |
+| Curtailment (MWh) | **9.8** | 22.3 | 44.0 |
+| Critical load cut (MWh) | **5.3** (-56%) | 12.1 | 13.5 |
+| All load cut incl. flexible (MWh) | **5.4** (-82%) | 30.1 | 32.8 |
+| Safety violations | **0.00** (max 0) | 4.87 | 3.60 |
+| CO₂ (t) | **557** (-42%) | 957 | 1062 |
 
 - **Cost:** the AI was cheaper on **100 of 100** days.
 - **Critical load cut:** the AI had some on 8 of 100 days, vs 20 for business-as-usual. These are physical shortages that no plan can cover, e.g. a storm hitting while the line is congested. The AI then protects critical load first and says so.
